@@ -1,0 +1,8 @@
+{
+  "run": "scripts/start.sh",
+  "build": "npm run build",
+  "environment": {
+    "NODE_ENV": "production"
+  },
+  "include": ["dist/", "client/dist/", "uploads/", "scripts/", "package.json", "package-lock.json"]
+}
