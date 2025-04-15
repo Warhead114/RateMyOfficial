@@ -1,0 +1,142 @@
+@import url('https://fonts.googleapis.com/css2?family=Teko:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+  }
+  
+  /* Improve viewport handling for mobile devices */
+  html, body {
+    @apply w-full overflow-x-hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+}
+
+@layer components {
+  .logo-text {
+    font-family: 'Teko', sans-serif;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+  
+  .athletic-text {
+    font-family: 'Oswald', sans-serif;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+  
+  /* Card components for consistent responsive behavior */
+  .responsive-card {
+    @apply bg-image-content rounded-md p-4 transition-all duration-200 hover:shadow-md;
+    @apply flex flex-col h-full;
+  }
+  
+  .responsive-card-image {
+    @apply w-full aspect-square object-cover rounded-md overflow-hidden;
+    @apply sm:aspect-[4/3] md:aspect-square;
+  }
+  
+  .logo-image {
+    @apply text-current h-8 w-auto sm:h-10;
+  }
+}
+
+@layer utilities {
+  /* Improved responsive containers */
+  .responsive-container {
+    @apply w-full px-4 mx-auto sm:px-6 lg:px-8 max-w-7xl;
+  }
+
+  /* Responsive navigation patterns */
+  .nav-container {
+    @apply flex flex-col items-center justify-between w-full p-4 gap-4 
+           sm:flex-row sm:gap-0;
+  }
+
+  .nav-items {
+    @apply flex flex-col items-center gap-4 w-full
+           sm:flex-row sm:justify-end sm:w-auto;
+  }
+
+  /* Grid layouts for different screen sizes */
+  .dashboard-grid {
+    @apply grid grid-cols-1 gap-4 p-4
+           sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4;
+  }
+  
+  /* Typography adjustments for responsive design */
+  .responsive-heading {
+    @apply text-xl sm:text-2xl md:text-3xl;
+  }
+  
+  .responsive-text {
+    @apply text-sm sm:text-base;
+  }
+  
+  /* Enhanced scrolling for mobile interfaces */
+  .scroll-container {
+    @apply overflow-y-auto overscroll-contain -webkit-overflow-scrolling-touch;
+    max-height: calc(100vh - 12rem);
+    scrollbar-width: thin;
+  }
+  
+  .scroll-container-sm {
+    @apply overflow-y-auto overscroll-contain -webkit-overflow-scrolling-touch;
+    max-height: 60vh;
+    scrollbar-width: thin;
+  }
+  
+  /* Custom scrollbar styling */
+  .styled-scrollbar::-webkit-scrollbar {
+    @apply w-1.5;
+  }
+  
+  .styled-scrollbar::-webkit-scrollbar-track {
+    @apply bg-transparent rounded-full;
+  }
+  
+  .styled-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-gray-400 rounded-full;
+  }
+  
+  .styled-scrollbar::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-500;
+  }
+  
+  /* Touch-optimized scrolling area */
+  .touch-scroll-area {
+    @apply overflow-auto overscroll-contain pb-8;
+    -webkit-overflow-scrolling: touch;
+    scroll-padding-bottom: 1rem;
+    max-height: calc(100vh - 16rem);
+    /* ensures form content is scrollable on mobile */
+    min-height: 70vh;
+  }
+  
+  /* Horizontal scrolling tabs with visual indicator */
+  [role="tablist"] {
+    @apply relative after:absolute after:right-0 after:top-0 after:h-full after:w-8 
+           after:bg-gradient-to-l after:from-background after:to-transparent after:opacity-70
+           after:pointer-events-none after:z-10;
+  }
+  
+  /* Hide scrollbars while maintaining functionality */
+  .no-scrollbar {
+    -ms-overflow-style: none;  /* Internet Explorer and Edge */
+    scrollbar-width: none;  /* Firefox */
+  }
+  
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;  /* Safari and Chrome */
+  }
+}
