@@ -1,0 +1,8 @@
+-- Publication-safe placeholder for historical account maintenance.
+--
+-- The original file updated a particular administrator's profile; it did not
+-- create a table or change the schema. Private account identifiers and names
+-- are intentionally omitted from this public snapshot.
+--
+-- This file intentionally executes no SQL. Perform any future profile
+-- maintenance privately through authorized controls, under separate approval.

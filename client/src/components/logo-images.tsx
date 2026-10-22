@@ -19,17 +19,14 @@ export const RefereeIcon: React.FC<{ className?: string }> = ({ className }) => 
 
 export const WrestlersIcon: React.FC<{ className?: string }> = ({ className }) => {
   return (
-    <div className={`${className} bg-background border-r border-l border-t-0 border-b-0 border-background`}>
-      <svg 
-        xmlns="http://www.w3.org/2000/svg" 
-        viewBox="0 0 640 512" 
-        width="100%" 
-        height="100%" 
-        fill="white"
+    <div className={`${className} relative`}>
+      <div className="absolute inset-0 bg-white rounded-full"></div>
+      <img 
+        src="/uploads/wrestlers-silhouette.png" 
+        alt="Wrestlers Silhouette" 
+        className="relative z-10 w-full h-full object-contain p-1"
         style={{ filter: 'drop-shadow(1px 1px 1px rgba(0,0,0,0.5))' }}
-      >
-        <path d="M128 96h32c17.7 0 32-14.3 32-32s-14.3-32-32-32H96C78.3 32 64 46.3 64 64s14.3 32 32 32zm64 32H480c17.7 0 32-14.3 32-32s-14.3-32-32-32H192c-17.7 0-32 14.3-32 32s14.3 32 32 32zm-64 64c0-17.7-14.3-32-32-32s-32 14.3-32 32s14.3 32 32 32s32-14.3 32-32zm448 0c0-17.7-14.3-32-32-32s-32 14.3-32 32s14.3 32 32 32s32-14.3 32-32zM160 320c0-17.7-14.3-32-32-32s-32 14.3-32 32s14.3 32 32 32s32-14.3 32-32zm384 0c0-17.7-14.3-32-32-32s-32 14.3-32 32s14.3 32 32 32s32-14.3 32-32zM224 416c0-17.7-14.3-32-32-32s-32 14.3-32 32s14.3 32 32 32s32-14.3 32-32zm192 0c0-17.7-14.3-32-32-32s-32 14.3-32 32s14.3 32 32 32s32-14.3 32-32z" />
-      </svg>
+      />
     </div>
   );
 };

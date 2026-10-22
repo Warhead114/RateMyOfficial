@@ -1,1397 +1,1996 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { createServer } from "http";
-import { storage } from "./storage";
+import {
+  ReviewValidationError,
+  UserVerificationConflictError,
+  storage,
+} from "./storage";
 import * as schema from "@shared/schema";
-import { insertOfficialSchema, insertReviewSchema, insertEventSchema, registerUserSchema, loginUserSchema, insertTeamSchema } from "@shared/schema";
+import { forgotPasswordSchema, insertOfficialSchema, insertReviewSchema, insertEventSchema, registerUserSchema, loginUserSchema, resetPasswordSchema, insertTeamSchema, verifyUserStatusSchema } from "@shared/schema";
 import { ZodError } from "zod";
 import passport from "passport";
 import session from "express-session";
-import MemoryStore from "memorystore";
 import connectPgSimple from "connect-pg-simple";
 import { eq, and } from "drizzle-orm";
 import { configurePassport } from "./auth/passport";
-import { isAuthenticated, isVerified } from "./auth/middleware";
-import { sendVerificationEmail, generateVerificationToken } from "./auth/email";
-import { sendEmail } from "./auth/email";
-import formidable from "formidable";
+import { isAdmin, isAuthenticated, isVerified } from "./auth/middleware";
 import { promises as fs } from "fs";
 import path from "path";
-import express from "express";
-import os from "os";
 import { pool } from "./db";
+import { User, users, InsertOfficial } from "@shared/schema"; // Assuming 'users' table and User type are available here
+import { db } from "./db"; // Assuming 'db' is your Drizzle ORM instance
+import { deleteAsset, saveImage, saveVideo, UploadError, VIDEO_MAX_BYTES } from "./upload-service";
+import { firstFile, parseImageMultipart, parseVideoMultipart } from "./multipart";
+import { logger } from "./logger";
+import {
+  canManageRegion,
+  filterToAuthorizedRegion,
+  isAdministrator,
+  isRegionalSupervisor,
+  normalizeRegion,
+} from "./services/permissions";
+import {
+  debugRoutesEnabled,
+  requireSessionSecret,
+  sessionCookieOptions,
+} from "./session-config";
+import bcrypt from "bcryptjs";
+import {
+  INVALID_RESET_MESSAGE,
+  hashPasswordResetToken,
+  PasswordResetService,
+} from "./auth/password-reset";
+import { DatabasePasswordResetRateLimiter } from "./auth/password-reset-rate-limit";
+import { withCoachNotificationStatus } from "./email/coach-notification-identity";
+import { sensitiveEmailPayloadProtectorFromEnvironment } from "./email/sensitive-payload";
+import { registerAdminRegionRoutes } from "./admin-regions";
+// Object Storage removed - using local uploads folder only
 
 // Use PostgreSQL for session storage to persist across restarts
 const PgSession = connectPgSimple(session);
 
-export async function registerRoutes(app: Express) {
-  // Configure session and passport
-  app.use('/uploads', express.static('uploads'));
-  app.use(session({
-    store: new PgSession({
-      pool: pool,
-      tableName: 'session',
-      createTableIfMissing: true,
-    }),
-    secret: process.env.SESSION_SECRET || "your-secret-key",
-    resave: false,
-    saveUninitialized: false,
-    cookie: { 
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 24 * 60 * 60 * 1000,
-      sameSite: 'none',
-      domain: process.env.NODE_ENV === "production" ? ".replit.app" : undefined
-    },
-    proxy: true
-  }));
+function sendReviewError(res: Response, error: unknown): Response {
+  if (error instanceof ReviewValidationError) {
+    return res.status(error.statusCode).json({ message: error.message });
+  }
 
-  app.use(passport.initialize());
-  app.use(passport.session());
-  configurePassport(passport);
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "23505"
+  ) {
+    return res.status(409).json({
+      message: "You have already reviewed this official for this event",
+    });
+  }
 
-  // Add admin middleware
-  const isAdmin = (req: Request, res: Response, next: NextFunction) => {
-    if (req.isAuthenticated() && req.user?.role === 'admin') {
-      next();
-    } else {
-      res.status(403).json({ message: 'Forbidden' });
+  logger.error("Review operation failed");
+  return res.status(500).json({ message: "Review operation failed" });
+}
+
+
+export async function registerRoutes(app: Express, dependencies: {
+  passwordResetLimiter?: DatabasePasswordResetRateLimiter;
+} = {}) {
+  try {
+    const sessionSecret = requireSessionSecret(process.env.SESSION_SECRET);
+
+    const isProduction = process.env.NODE_ENV === "production";
+    const forgotPasswordResponse = {
+      message:
+        "If an account exists for that email address, password reset instructions have been queued.",
+    };
+    const resetLimiter = dependencies.passwordResetLimiter || new DatabasePasswordResetRateLimiter(db);
+    if (isProduction) {
+      app.set("trust proxy", 1);
     }
-  };
-  
-  // Add middleware for Admin or Regional Supervisor
-  const isAdminOrSupervisor = (req: Request, res: Response, next: NextFunction) => {
-    if (req.isAuthenticated() && 
-       (req.user?.role === 'admin' || req.user?.userType === 'Regional Supervisor')) {
-      next();
-    } else {
-      res.status(403).json({ message: 'Forbidden' });
-    }
-  };
 
-  // Auth routes
-  app.post("/api/auth/register", async (req, res) => {
-    try {
-      const userData = registerUserSchema.parse(req.body);
+    // Handle CORS preflight for mobile browsers
+    app.options('/uploads/*', (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+      res.setHeader('Access-Control-Max-Age', '86400');
+      res.sendStatus(204);
+    });
 
-      // Check if user already exists
-      const existingUser = await storage.getUserByEmail(userData.email);
-      if (existingUser) {
-        return res.status(400).json({ message: "Email already registered" });
+    // Health check endpoint
+    app.get("/api/health", async (req, res) => {
+      let client;
+      try {
+        client = await pool.connect();
+        await client.query("SELECT 1");
+        return res.json({ status: "healthy", database: "connected" });
+      } catch {
+        return res.status(503).json({
+          status: "degraded",
+          database: "disconnected",
+        });
+      } finally {
+        client?.release();
+      }
+    });
+
+    // Serve photos from Object Storage
+    app.get('/storage/:path(*)', async (req, res) => {
+      try {
+        const { Client } = await import('@replit/object-storage');
+        const objectStorage = new Client();
+        
+        const objectPath = req.params.path;
+        const downloadResult = await objectStorage.downloadAsBytes(objectPath);
+        if (!downloadResult.ok) {
+          throw new Error(downloadResult.error.message);
+        }
+        const [fileBuffer] = downloadResult.value;
+        
+        const ext = path.extname(objectPath).toLowerCase();
+        const contentTypes: Record<string, string> = {
+          '.jpg': 'image/jpeg',
+          '.jpeg': 'image/jpeg',
+          '.png': 'image/png',
+          '.webp': 'image/webp',
+          '.gif': 'image/gif',
+          '.heic': 'image/heic',
+          '.heif': 'image/heif'
+        };
+        
+        res.setHeader('Content-Type', contentTypes[ext] || 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=31536000');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.send(fileBuffer);
+      } catch (error) {
+        console.error('Error serving photo from Object Storage:', error);
+        res.status(404).send('File not found');
+      }
+    });
+
+    app.use(session({
+      store: new PgSession({
+        pool: pool,
+        tableName: 'session',
+        createTableIfMissing: true,
+      }),
+      secret: sessionSecret,
+      resave: false,
+      saveUninitialized: false,
+      cookie: sessionCookieOptions(isProduction),
+      proxy: isProduction
+    }));
+
+    app.use(passport.initialize());
+    app.use(passport.session());
+    configurePassport(passport);
+    registerAdminRegionRoutes(app, storage);
+    // Add middleware for Admin or Regional Supervisor
+    const isAdminOrSupervisor = (req: Request, res: Response, next: NextFunction) => {
+      if (req.isAuthenticated() &&
+        (req.user?.role === 'admin' || isRegionalSupervisor(req.user))) {
+        next();
+      } else {
+        res.status(403).json({ message: 'Forbidden' });
+      }
+    };
+
+    const canManageTargetRegion = (
+      req: Request,
+      res: Response,
+      targetRegion: string | null | undefined,
+    ): boolean => {
+      if (canManageRegion(req.user, targetRegion)) {
+        return true;
+      }
+      res.status(403).json({ message: "Forbidden for this region" });
+      return false;
+    };
+
+    const eventResourcesAreAuthorized = async (
+      req: Request,
+      event: schema.InsertEvent,
+    ): Promise<boolean> => {
+      if (isAdministrator(req.user)) {
+        return true;
+      }
+      if (!canManageRegion(req.user, event.region)) {
+        return false;
       }
 
-      // If user is a coach and has a school, add it to the teams table
-      if (userData.userType === "Coach" && userData.school) {
-        try {
-          // Check if team already exists with this name
-          const existingTeams = await storage.getTeams();
-          const teamExists = existingTeams.some(team => 
-            team.name.toLowerCase() === userData.school?.toLowerCase()
-          );
-          
-          // If the team doesn't exist, create it
-          if (!teamExists && userData.school) {
-            await storage.createTeam({ name: userData.school });
-            console.log(`Created new team from coach's school: ${userData.school}`);
-          }
-        } catch (error) {
-          console.error('Error creating team from school:', error);
-          // Continue with user creation even if team creation fails
+      for (const assignment of event.officials || []) {
+        const official = await storage.getOfficialById(assignment.officialId);
+        if (!official || !canManageRegion(req.user, official.association)) {
+          return false;
         }
       }
 
-      // Create user - email verification is not used anymore
-      const user = await storage.createUser(userData);
-      
-      // We're no longer using email verification
-      // The user will be marked as verified when an admin approves them
-
-      res.status(201).json({ 
-        message: "Thank you for registering. Your account is pending approval from an administrator." 
-      });
-    } catch (e) {
-      if (e instanceof ZodError) {
-        return res.status(400).json({ message: "Invalid registration data", errors: e.errors });
+      for (const teamId of event.teams || []) {
+        const team = await storage.getTeamById(teamId);
+        if (!team || !canManageRegion(req.user, team.region)) {
+          return false;
+        }
       }
-      console.error('Registration error:', e);
-      res.status(500).json({ message: "Registration failed. Please try again." });
-    }
-  });
+      return true;
+    };
 
-  app.get("/api/auth/verify", async (req, res) => {
-    const token = req.query.token as string;
-    if (!token) {
-      return res.status(400).json({ message: "Verification token required" });
-    }
-
-    const success = await storage.verifyUser(token);
-    if (!success) {
-      return res.status(400).json({ message: "Invalid or expired verification token" });
-    }
-
-    res.json({ message: "Email verified successfully" });
-  });
-
-  app.post("/api/auth/login", passport.authenticate("local"), (req, res) => {
-    // Return complete user object with all necessary fields
-    res.json({
-      id: req.user!.id,
-      email: req.user!.email,
-      firstName: req.user!.firstName,
-      lastName: req.user!.lastName,
-      role: req.user!.role,
-      userType: req.user!.userType,
-      school: req.user!.school,
-      yearsCoaching: req.user!.yearsCoaching,
-      region: req.user!.region,
-      yearsExperience: req.user!.yearsExperience,
-      photoUrl: req.user!.photoUrl,
-      isVerified: req.user!.isVerified
-    });
-  });
-
-  app.post("/api/auth/logout", (req, res) => {
-    req.logout(() => {
-      res.json({ message: "Logged out successfully" });
-    });
-  });
-
-  app.get("/api/auth/me", (req, res) => {
-    if (!req.user) {
-      return res.status(401).json({ message: "Not authenticated" });
-    }
-    // Return complete user object including all profile fields
-    res.json({
-      id: req.user.id,
-      email: req.user.email,
-      firstName: req.user.firstName,
-      lastName: req.user.lastName,
-      role: req.user.role,
-      userType: req.user.userType,
-      school: req.user.school,
-      yearsCoaching: req.user.yearsCoaching,
-      region: req.user.region,
-      yearsExperience: req.user.yearsExperience,
-      photoUrl: req.user.photoUrl,
-      isVerified: req.user.isVerified
-    });
-  });
-
-
-  // User management routes
-  app.get("/api/users/pending", isAdminOrSupervisor, async (req, res) => {
-    try {
-      let pendingUsers;
-      
-      // Regional supervisors can only see users in their region
-      if (req.user?.userType === 'Regional Supervisor' && req.user?.region) {
-        pendingUsers = await storage.getPendingUsers();
-        // Filter to only show coaches in their region
-        pendingUsers = pendingUsers.filter(user => 
-          user.userType === 'Coach' && user.region === req.user?.region
-        );
-      } else {
-        // Admins can see all pending users
-        pendingUsers = await storage.getPendingUsers();
-      }
-      
-      res.json(pendingUsers);
-    } catch (error) {
-      console.error('Error fetching pending users:', error);
-      res.status(500).json({ 
-        message: error instanceof Error ? error.message : "Failed to fetch pending users" 
-      });
-    }
-  });
-
-  app.post("/api/users/:id/verify", isAdminOrSupervisor, async (req, res) => {
-    const userId = parseInt(req.params.id);
-    const { approved } = req.body;
-
-    const user = await storage.getUserById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    if (approved) {
-      // Directly mark the user as verified
-      await storage.updateUserProfile(userId, {
-        isVerified: true,
-        verificationToken: null,
-        verificationExpires: null
-      });
-      
+    // Auth routes
+    app.post("/api/auth/register", async (req, res) => {
       try {
-        // Send approval email
-        await sendEmail(
-          user.email,
-          "RateMyOfficial Account Approved",
-          `<h1>Welcome to RateMyOfficial!</h1>
-          <p>Your account has been approved. You can now log in and start using the platform.</p>`
-        );
-      } catch (error) {
-        console.error('Failed to send approval email:', error);
-        // Continue with approval even if email fails
-      }
-    } else {
-      await storage.deleteUser(userId);
-      // Send rejection email
-      await sendEmail(
-        user.email,
-        "RateMyOfficial Account Status",
-        `<h1>RateMyOfficial Account Update</h1>
-        <p>We regret to inform you that your account application has not been approved at this time.</p>`
-      );
-    }
+        logger.debug("Registration started");
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
 
-    res.json({ message: "User verification status updated" });
-  });
-  
-  // Add a DELETE route for user management
-  app.delete("/api/admin/users/:id", isAuthenticated, isAdmin, async (req, res) => {
-    try {
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        // Extract user data from fields
+        const userType = fields.userType?.[0] as 'Coach' | 'Regional Supervisor' || 'Coach';
+        const userData: any = {
+          firstName: fields.firstName?.[0]?.trim() || '',
+          lastName: fields.lastName?.[0]?.trim() || '',
+          email: fields.email?.[0]?.trim().toLowerCase() || '',
+          password: fields.password?.[0] || '',
+          confirmPassword: fields.confirmPassword?.[0] || fields.password?.[0] || '',
+          userType: userType,
+        };
+
+        // Add role-specific fields
+        if (userType === 'Coach') {
+          userData.school = fields.school?.[0]?.trim();
+          if (fields.yearsCoaching?.[0]) {
+            userData.yearsCoaching = parseInt(fields.yearsCoaching[0], 10);
+          }
+        } else if (userType === 'Regional Supervisor') {
+          userData.region = fields.region?.[0]?.trim();
+          if (fields.yearsExperience?.[0]) {
+            userData.yearsExperience = parseInt(fields.yearsExperience[0], 10);
+          }
+        }
+
+        // Validate with schema
+        const validatedData = registerUserSchema.parse(userData);
+
+        // Check if user already exists
+        const existingUser = await storage.getUserByEmail(validatedData.email);
+        if (existingUser) {
+          return res.status(400).json({ message: "Email already registered" });
+        }
+
+        // If user is a coach and has a school, add it to the teams table
+        if (validatedData.userType === "Coach" && validatedData.school) {
+          try {
+            const existingTeams = await storage.getTeams();
+            const existingTeam = existingTeams.find(team =>
+              team.name.toLowerCase() === validatedData.school?.toLowerCase()
+            );
+            if (existingTeam?.region) {
+              validatedData.region = existingTeam.region;
+            }
+          } catch (error) {
+            logger.warn("Unable to derive coach region");
+          }
+        }
+
+        let savedPhotoUrl: string | null = null;
+        // Images are decoded and converted by the upload service; client names
+        // and MIME declarations are never used as storage metadata.
+        if (files.photo) {
+          const photo = firstFile(files, "photo");
+          if (photo && photo.size > 0) {
+            try {
+              const asset = await saveImage(photo);
+              savedPhotoUrl = asset.url;
+            } catch (photoError) {
+              if (photoError instanceof UploadError) return res.status(photoError.statusCode).json({ message: photoError.message });
+              throw photoError;
+            }
+          }
+        }
+
+        try {
+          await storage.createUserWithRegistrationEmail(
+            validatedData,
+            savedPhotoUrl,
+          );
+          savedPhotoUrl = null;
+        } catch (error) {
+          await deleteAsset(savedPhotoUrl);
+          throw error;
+        }
+
+        res.status(201).json({
+          message: "Thank you for registering. Your account is pending approval from an administrator."
+        });
+      } catch (e) {
+        if (e instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid registration data", errors: e.errors });
+        }
+        logger.error("Registration failed");
+        res.status(500).json({ message: "Registration failed. Please try again." });
+      }
+    });
+
+    app.post("/api/auth/login", passport.authenticate("local"), (req, res) => {
+      // Return complete user object with all necessary fields
+      res.json({
+        id: req.user!.id,
+        email: req.user!.email,
+        firstName: req.user!.firstName,
+        lastName: req.user!.lastName,
+        role: req.user!.role,
+        userType: req.user!.userType,
+        school: req.user!.school,
+        yearsCoaching: req.user!.yearsCoaching,
+        region: req.user!.region,
+        yearsExperience: req.user!.yearsExperience,
+        photoUrl: req.user!.photoUrl,
+        isVerified: req.user!.isVerified
+      });
+    });
+
+    app.post("/api/auth/forgot-password", async (req, res) => {
+      const responseStartedAt = Date.now();
+      const parsed = forgotPasswordSchema.safeParse(req.body);
+      if (parsed.success) {
+        const normalizedEmail = parsed.data.email.toLowerCase();
+        try {
+          const ipAllowed = await resetLimiter.allow("ip", req.ip || "unknown", 5, 15 * 60_000);
+          const emailAllowed = ipAllowed &&
+            await resetLimiter.allow("email", normalizedEmail, 3, 15 * 60_000);
+          if (ipAllowed && emailAllowed) {
+            const resetService = new PasswordResetService(
+              db,
+              sensitiveEmailPayloadProtectorFromEnvironment(),
+              process.env.APP_URL,
+            );
+            await resetService.requestReset(normalizedEmail);
+          }
+        } catch {
+          logger.error("Password reset request could not be queued");
+        }
+      }
+      const minimumResponseMs = 250;
+      const remainingDelay = minimumResponseMs - (Date.now() - responseStartedAt);
+      if (remainingDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remainingDelay));
+      }
+      return res.json(forgotPasswordResponse);
+    });
+
+    app.post("/api/auth/reset-password", async (req, res) => {
+      try {
+        if (!await resetLimiter.allow("reset-ip", req.ip || "unknown", 20, 15 * 60_000)) {
+          return res.status(429).json({ message: "Too many reset attempts. Please try again later." });
+        }
+      } catch {
+        return res.status(503).json({ message: "Password reset is temporarily unavailable" });
+      }
+      const parsed = resetPasswordSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ message: INVALID_RESET_MESSAGE });
+      }
+      try {
+        const resetService = new PasswordResetService(db);
+        await resetService.resetPassword(
+          parsed.data.token,
+          parsed.data.newPassword,
+        );
+        return res.json({ message: "Password updated successfully" });
+      } catch {
+        return res.status(400).json({ message: INVALID_RESET_MESSAGE });
+      }
+    });
+
+    app.post("/api/auth/logout", (req, res) => {
+      req.logout((err) => {
+        if (err) {
+          logger.error("Logout failed");
+          return res.status(500).json({ message: "Error during logout" });
+        }
+        res.json({ message: "Logged out successfully" });
+      });
+    });
+
+    app.get("/api/auth/me", (req, res) => {
+      if (!req.user) {
+        return res.status(401).json({ message: "Not authenticated" });
+      }
+      // Return complete user object including all profile fields
+      res.json({
+        id: req.user.id,
+        email: req.user.email,
+        firstName: req.user.firstName,
+        lastName: req.user.lastName,
+        role: req.user.role,
+        userType: req.user.userType,
+        school: req.user.school,
+        yearsCoaching: req.user.yearsCoaching,
+        region: req.user.region,
+        yearsExperience: req.user.yearsExperience,
+        photoUrl: req.user.photoUrl,
+        isVerified: req.user.isVerified
+      });
+    });
+
+
+    // User management routes
+    app.get("/api/users/pending", isAdminOrSupervisor, async (req, res) => {
+      try {
+        const pendingUsers = await storage.getPendingUsers();
+        res.json(filterToAuthorizedRegion(req.user, pendingUsers));
+      } catch (error) {
+        logger.error("Failed to fetch pending users");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to fetch pending users"
+        });
+      }
+    });
+
+    app.get("/api/users/supervisors", isAdminOrSupervisor, async (req, res) => {
+      try {
+        // Get all Regional Supervisors
+        const supervisors = filterToAuthorizedRegion(
+          req.user,
+          await storage.getUsersByType('Regional Supervisor'),
+        );
+
+        // Format the response to match frontend expectations
+        const formattedSupervisors = supervisors.map(supervisor => ({
+          id: supervisor.id,
+          email: supervisor.email,
+          firstName: supervisor.firstName,
+          lastName: supervisor.lastName,
+          region: supervisor.region || null,
+          yearsExperience: supervisor.yearsExperience || null,
+          photoUrl: supervisor.photoUrl || null,
+          verified: supervisor.isVerified
+        }));
+
+        res.json({
+          data: formattedSupervisors,
+          total: formattedSupervisors.length
+        });
+      } catch (error) {
+        logger.error("Failed to fetch supervisors");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to fetch supervisors"
+        });
+      }
+    });
+
+    app.post("/api/users/:id/verify", isAdminOrSupervisor, async (req, res) => {
       const userId = parseInt(req.params.id);
-      
+      const parsedDecision = verifyUserStatusSchema.safeParse(req.body);
+      if (!parsedDecision.success) {
+        return res.status(400).json({
+          message: "Request body must contain only a boolean approved field",
+        });
+      }
+      const { approved } = parsedDecision.data;
+
       const user = await storage.getUserById(userId);
       if (!user) {
         return res.status(404).json({ message: "User not found" });
       }
-      
-      await storage.deleteUser(userId);
-      res.json({ message: "User deleted successfully" });
-    } catch (error) {
-      console.error('Error deleting user:', error);
-      res.status(500).json({ 
-        message: error instanceof Error ? error.message : "Failed to delete user" 
-      });
-    }
-  });
+      if (!canManageTargetRegion(req, res, user.region)) {
+        return;
+      }
 
-  app.put("/api/users/profile", isAuthenticated, async (req, res) => {
-    try {
-      console.log('Processing profile update for user:', req.user?.id);
-      const uploadsDir = path.join(process.cwd(), "uploads");
-      await fs.mkdir(uploadsDir, { recursive: true });
+      try {
+        const updatedUser = await storage.verifyUserWithStatusEmail(
+          userId,
+          approved,
+        );
+        if (!updatedUser) {
+          return res.status(404).json({ message: "User not found" });
+        }
+      } catch (error) {
+        if (error instanceof UserVerificationConflictError) {
+          return res.status(error.statusCode).json({ message: error.message });
+        }
+        logger.error("User verification failed");
+        return res.status(500).json({ message: "User verification failed" });
+      }
 
-      const form = formidable({
-        maxFileSize: 5 * 1024 * 1024,
-        uploadDir: uploadsDir,
-        keepExtensions: true,
-      });
+      res.json({ message: "User verification status updated" });
+    });
 
-      const [fields, files] = await new Promise((resolve, reject) => {
-        form.parse(req, (err, fields, files) => {
-          if (err) reject(err);
-          resolve([fields, files]);
+    // Add a DELETE route for user management
+    app.delete("/api/admin/users/:id", isAuthenticated, isAdmin, async (req, res) => {
+      try {
+        const userId = parseInt(req.params.id);
+
+        const user = await storage.getUserById(userId);
+        if (!user) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        await storage.deleteUser(userId);
+        res.json({ message: "User deleted successfully" });
+      } catch (error) {
+        logger.error("User deletion failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to delete user"
         });
-      });
+      }
+    });
 
-      // Create updates object with proper type conversion
-      const updates: Partial<User> = {};
+    app.put("/api/users/profile", isAuthenticated, async (req, res) => {
+      try {
+        logger.debug("Profile update started");
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
 
-      // Handle basic fields
-      if (fields.firstName?.[0]) updates.firstName = fields.firstName[0];
-      if (fields.lastName?.[0]) updates.lastName = fields.lastName[0];
-      if (fields.email?.[0]) updates.email = fields.email[0];
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
 
-      // Handle role-specific fields with proper type conversion
-      if (req.user?.userType === "Coach") {
-        // If school is updated, check if we need to add it to teams
-        if (fields.school?.[0]) {
-          const newSchool = fields.school[0];
-          updates.school = newSchool;
-          
-          // Add school to teams if it doesn't exist already
-          try {
-            // Check if team already exists with this name
-            const existingTeams = await storage.getTeams();
-            const teamExists = existingTeams.some(team => 
-              team.name.toLowerCase() === newSchool.toLowerCase()
-            );
-            
-            // If the team doesn't exist, create it
-            if (!teamExists && newSchool) {
-              await storage.createTeam({ name: newSchool });
-              console.log(`Created new team from coach's updated school: ${newSchool}`);
+        // Create updates object with proper type conversion
+        const updates: Partial<User> = {};
+
+        // Handle basic fields
+        if (fields.firstName?.[0]) updates.firstName = fields.firstName[0];
+        if (fields.lastName?.[0]) updates.lastName = fields.lastName[0];
+        if (fields.email?.[0]) updates.email = fields.email[0];
+
+        // Handle role-specific fields with proper type conversion
+        if (req.user?.userType === "Coach") {
+          // If school is updated, check if we need to add it to teams
+          if (fields.school?.[0]) {
+            const newSchool = fields.school[0];
+            updates.school = newSchool;
+
+            // Add school to teams if it doesn't exist already
+            try {
+              // Check if team already exists with this name
+              const existingTeams = await storage.getTeams();
+              const teamExists = existingTeams.some(team =>
+                team.name.toLowerCase() === newSchool.toLowerCase()
+              );
+
+              // If the team doesn't exist, create it
+              if (!teamExists && newSchool) {
+                await storage.createTeam({
+                  name: newSchool,
+                  region: req.user?.region || null,
+                });
+                logger.info("Coach team created during profile update");
+              }
+            } catch (error) {
+              logger.warn("Coach team creation failed during profile update");
+              // Continue with user update even if team creation fails
             }
-          } catch (error) {
-            console.error('Error creating team from updated school:', error);
-            // Continue with user update even if team creation fails
+          }
+
+          if (fields.yearsCoaching?.[0]) {
+            const yearsCoaching = parseInt(fields.yearsCoaching[0], 10);
+            if (!isNaN(yearsCoaching)) {
+              updates.yearsCoaching = yearsCoaching;
+            }
+          }
+
+        } else if (req.user?.userType === "Regional Supervisor") {
+          if (fields.yearsExperience?.[0]) {
+            const yearsExperience = parseInt(fields.yearsExperience[0], 10);
+            if (!isNaN(yearsExperience)) {
+              updates.yearsExperience = yearsExperience;
+            }
           }
         }
-        
+
+        // Store profile photos through the authoritative validated upload service.
+        if (files.photo) {
+          const photo = firstFile(files, "photo");
+          if (photo && photo.size > 0) {
+            try {
+              updates.photoUrl = (await saveImage(photo)).url;
+            } catch (error) {
+              if (error instanceof UploadError) return res.status(error.statusCode).json({ message: error.message });
+              logger.error("Profile photo processing failed");
+              return res.status(500).json({
+                message: "Error processing uploaded photo. Please try again.",
+                details: error instanceof Error ? error.message : 'Unknown error'
+              });
+            }
+          }
+        }
+
+        const updatedUser = await storage.updateUserProfile(req.user!.id, updates);
+        logger.info("Profile update successful");
+
+        // Update session data to reflect changes
+        if (req.user) {
+          Object.assign(req.user, updatedUser);
+        }
+
+        res.json(updatedUser);
+      } catch (error) {
+        logger.error("Profile update failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to update profile"
+        });
+      }
+    });
+
+    // Protected routes that require authentication
+    app.post("/api/officials/:id/reviews", isAuthenticated, async (req, res) => {
+      try {
+        const officialId = parseInt(req.params.id);
+
+        // Handle form data for video uploads
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
+
+        const { fields, files } = await parseVideoMultipart(req, VIDEO_MAX_BYTES);
+
+        // Extract review data from fields
+        const reviewData = {
+          officialId,
+          userId: req.user!.id,
+          eventId: parseInt(fields.eventId?.[0] || '0'),
+          mechanics: parseInt(fields.mechanics?.[0] || '', 10),
+          professionalism: parseInt(fields.professionalism?.[0] || '', 10),
+          positioning: parseInt(fields.positioning?.[0] || '', 10),
+          stalling: parseInt(fields.stalling?.[0] || '', 10),
+          consistency: parseInt(fields.consistency?.[0] || '', 10),
+          appearance: parseInt(fields.appearance?.[0] || '', 10),
+          comment: fields.comment?.[0] || "",
+          isAnonymous: false
+        };
+
+        // Handle video upload
+        let videoUrl = null;
+        if (files.video) {
+          const video = firstFile(files, "video");
+          if (video && video.size > 0) {
+            try {
+              videoUrl = (await saveVideo(video)).url;
+            } catch (videoError) {
+              if (videoError instanceof UploadError) return res.status(videoError.statusCode).json({ message: videoError.message });
+              logger.error("Review video processing failed");
+              return res.status(500).json({ message: "Error processing uploaded video. Please try again." });
+            }
+          }
+        }
+
+        let created;
+        try {
+          created = await storage.createReview({ ...reviewData, videoUrl });
+        } catch (error) {
+          await deleteAsset(videoUrl);
+          throw error;
+        }
+        res.status(201).json(created);
+      } catch (e) {
+        if (e instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid review data", errors: e.errors });
+        }
+        return sendReviewError(res, e);
+      }
+    });
+
+    // Existing routes...
+    app.get("/api/officials", async (_req, res) => {
+      console.log('GET /api/officials - Fetching all officials');
+      try {
+        const officialsResponse = await storage.getOfficials();
+        console.log('Officials response:', officialsResponse);
+
+        // Handle both old and new response formats
+        const officials = officialsResponse.data || [];
+        const total = officialsResponse.total || 0;
+
+        console.log('Officials found:', total, 'officials');
+        if (officials.length > 0) {
+          console.log('Official names:', officials.map(o => `${o.firstName} ${o.lastName}`));
+        }
+
+        res.json({
+          data: officials,
+          total: total
+        });
+      } catch (error) {
+        console.error('Error fetching officials:', error);
+        res.status(500).json({
+          message: 'Failed to fetch officials',
+          error: error instanceof Error ? error.message : "Unknown error"
+        });
+      }
+    });
+
+    app.get("/api/officials/search", async (req, res) => {
+      const query = req.query.q as string;
+      if (!query) {
+        return res.status(400).json({ message: "Search query required" });
+      }
+
+      // Validate and sanitize search query
+      if (query.length > 100) {
+        return res.status(400).json({ message: "Search query too long" });
+      }
+
+      if (query.trim().length === 0) {
+        return res.status(400).json({ message: "Search query cannot be empty" });
+      }
+
+      try {
+        const results = await storage.searchOfficials(query.trim());
+        res.json(results);
+      } catch (error) {
+        console.error('Search error:', error);
+        res.status(500).json({ message: "Search failed" });
+      }
+    });
+
+    app.get("/api/officials/:id", async (req, res) => {
+      const id = parseInt(req.params.id);
+      const official = await storage.getOfficialById(id);
+      if (!official) {
+        return res.status(404).json({ message: "Official not found" });
+      }
+      res.json(official);
+    });
+
+    app.get("/api/officials/slug/:slug", async (req, res) => {
+      try {
+        const slug = req.params.slug;
+        console.log(`Fetching official by slug: ${slug}`);
+        const official = await storage.getOfficialBySlug(slug);
+        if (!official) {
+          console.log(`Official not found for slug: ${slug}`);
+          return res.status(404).json({ message: "Official not found" });
+        }
+        console.log(`Official found: ${official.firstName} ${official.lastName}`);
+        res.json(official);
+      } catch (error) {
+        console.error('Error fetching official by slug:', error);
+        res.status(500).json({
+          message: "Failed to fetch official",
+          error: error instanceof Error ? error.message : "Unknown error"
+        });
+      }
+    });
+
+    app.get("/api/officials/:id/rating-breakdown", async (req, res) => {
+      const officialId = parseInt(req.params.id, 10);
+      if (!Number.isInteger(officialId) || officialId <= 0) {
+        return res.status(400).json({ message: "Invalid official ID" });
+      }
+
+      const official = await storage.getOfficialById(officialId);
+      if (!official) {
+        return res.status(404).json({ message: "Official not found" });
+      }
+
+      res.json(await storage.getOfficialRatingBreakdown(officialId));
+    });
+
+    app.get("/api/officials/slug/:slug/rating-breakdown", async (req, res) => {
+      const official = await storage.getOfficialBySlug(req.params.slug);
+      if (!official) {
+        return res.status(404).json({ message: "Official not found" });
+      }
+
+      res.json(await storage.getOfficialRatingBreakdown(official.id));
+    });
+
+    // Get reviews for an official
+    app.get("/api/officials/:id/reviews", async (req, res) => {
+      try {
+        const officialId = parseInt(req.params.id);
+        const official = await storage.getOfficialById(officialId);
+        if (!official) {
+          return res.status(404).json({ message: "Official not found" });
+        }
+        const showPending =
+          isAdministrator(req.user) ||
+          (isRegionalSupervisor(req.user) &&
+            canManageRegion(req.user, official.association));
+        const reviews = await storage.getReviewsForOfficial(officialId, showPending);
+        res.json(reviews);
+      } catch (error) {
+        console.error('Error fetching reviews:', error);
+        res.status(500).json({ message: "Failed to fetch reviews" });
+      }
+    });
+
+    app.get("/api/officials/slug/:slug/reviews", async (req, res) => {
+      try {
+        const slug = req.params.slug;
+        console.log(`Fetching reviews for slug: ${slug}`);
+        const official = await storage.getOfficialBySlug(slug);
+        if (!official) {
+          console.log(`Official not found for slug: ${slug}`);
+          return res.status(404).json({ message: "Official not found" });
+        }
+        const showPending =
+          isAdministrator(req.user) ||
+          (isRegionalSupervisor(req.user) &&
+            canManageRegion(req.user, official.association));
+        const reviews = await storage.getReviewsForOfficial(official.id, showPending);
+        res.json(reviews);
+      } catch (error) {
+        console.error('Error fetching reviews:', error);
+        res.status(500).json({
+          message: "Failed to fetch reviews",
+          error: error instanceof Error ? error.message : "Unknown error"
+        });
+      }
+    });
+
+    app.get("/api/officials/slug/:slug/events", async (req, res) => {
+      try {
+        const slug = req.params.slug;
+        console.log(`Fetching events for slug: ${slug}`);
+        const official = await storage.getOfficialBySlug(slug);
+        if (!official) {
+          console.log(`Official not found for slug: ${slug}`);
+          return res.status(404).json({ message: "Official not found" });
+        }
+        const events = await storage.getEventsForOfficial(official.id);
+        console.log(`Found ${events.length} events for ${official.firstName} ${official.lastName}`);
+        res.json(events);
+      } catch (error) {
+        console.error('Error fetching events:', error);
+        res.status(500).json({
+          message: "Failed to fetch events",
+          error: error instanceof Error ? error.message : "Unknown error"
+        });
+      }
+    });
+
+    app.get("/api/events", async (_req, res) => {
+      logger.debug("Fetching events");
+      try {
+        const events = await storage.getEvents();
+        logger.debug("Fetched events", { count: events.length });
+        // Ensure we always return an array
+        const eventsArray = Array.isArray(events) ? events : [];
+        res.json(eventsArray);
+      } catch (error) {
+        logger.error("Events fetch failed");
+        res.status(500).json({ message: 'Failed to fetch events' });
+      }
+    });
+
+    app.get("/api/events/search", async (req, res) => {
+      const query = req.query.q as string;
+      const filters = {
+        startDate: req.query.startDate ? new Date(req.query.startDate as string) : undefined,
+        endDate: req.query.endDate ? new Date(req.query.endDate as string) : undefined,
+        eventType: req.query.eventType as string,
+        venue: req.query.venue as string,
+        host: req.query.host as string
+      };
+
+      if (!query && !Object.values(filters).some(v => v !== undefined)) {
+        return res.status(400).json({ message: "Search query or filters required" });
+      }
+
+      const results = await storage.searchEvents(query || "", filters);
+      res.json(results);
+    });
+
+    app.get("/api/events/:id", async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        const event = await storage.getEventById(id);
+        if (!event) {
+          return res.status(404).json({ message: "Event not found" });
+        }
+
+        // Get officials assigned to this event
+        const officials = await storage.getEventOfficials(id);
+
+        res.json({
+          ...event,
+          officials: officials.map(official => ({
+            officialId: official.id,
+            firstName: official.firstName,
+            lastName: official.lastName,
+            role: (official as schema.Official & { role?: string | null }).role
+          }))
+        });
+      } catch (error) {
+        logger.error("Event fetch failed");
+        res.status(500).json({ message: "Failed to fetch event details" });
+      }
+    });
+
+    app.put("/api/events/:id", isAuthenticated, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+
+        // Check if user is Admin or Regional Supervisor
+        const isAdmin = req.user?.role === 'admin';
+        const supervisorAuthorized = isRegionalSupervisor(req.user);
+
+        if (!isAdmin && !supervisorAuthorized) {
+          return res.status(403).json({ message: "Only Admins and Regional Supervisors can update events" });
+        }
+
+        const existingEvent = await storage.getEventById(id);
+        if (!existingEvent) {
+          return res.status(404).json({ message: "Event not found" });
+        }
+        if (!canManageTargetRegion(req, res, existingEvent.region)) {
+          return;
+        }
+
+        // Validate event data
+        const event = insertEventSchema.parse({
+          ...req.body,
+          region: isAdministrator(req.user) ? req.body.region : req.user?.region,
+        });
+        if (!(await eventResourcesAreAuthorized(req, event))) {
+          return res.status(403).json({ message: "Event resources must be in your region" });
+        }
+
+        // Ensure at least one official is assigned
+        if (!event.officials || event.officials.length === 0) {
+          return res.status(400).json({ message: "At least one official must be assigned to the event" });
+        }
+
+        // Update the event
+        const updatedEvent = await storage.updateEvent(id, event);
+        res.json(updatedEvent);
+      } catch (error) {
+        logger.error("Event update failed");
+        if (error instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid event data", errors: error.errors });
+        }
+        res.status(500).json({ message: error instanceof Error ? error.message : "Failed to update event" });
+      }
+    });
+
+    // Add PATCH endpoint for updating events (for compatibility with the frontend)
+    app.patch("/api/events/:id", isAuthenticated, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+
+        if (isNaN(id)) {
+          return res.status(400).json({ message: "Invalid event ID" });
+        }
+
+        // Check if user exists and is authenticated
+        if (!req.user) {
+          logger.warn("Event update missing authenticated user");
+          return res.status(401).json({ message: "Authentication required" });
+        }
+
+        // Check if user is Admin or Regional Supervisor
+        const isAdmin = req.user.role === 'admin';
+        const supervisorAuthorized = isRegionalSupervisor(req.user);
+
+        if (!isAdmin && !supervisorAuthorized) {
+          logger.warn("Event update authorization denied");
+          return res.status(403).json({ message: "Only Admins and Regional Supervisors can update events" });
+        }
+
+        // Verify event exists before attempting update
+        const existingEvent = await storage.getEventById(id);
+        if (!existingEvent) {
+          return res.status(404).json({ message: "Event not found" });
+        }
+        if (!canManageTargetRegion(req, res, existingEvent.region)) {
+          return;
+        }
+
+        // Validate event data
+        const event = insertEventSchema.parse({
+          ...req.body,
+          region: isAdministrator(req.user) ? req.body.region : req.user.region,
+        });
+        if (!(await eventResourcesAreAuthorized(req, event))) {
+          return res.status(403).json({ message: "Event resources must be in your region" });
+        }
+
+        // Ensure at least one official is assigned
+        if (!event.officials || event.officials.length === 0) {
+          logger.warn("Event update validation failed");
+          return res.status(400).json({ message: "At least one official must be assigned to the event" });
+        }
+
+        // Update the event
+        const updatedEvent = await storage.updateEvent(id, event);
+        logger.info("Event updated");
+
+        res.json(updatedEvent);
+      } catch (error) {
+        logger.error("Event update failed");
+
+        if (error instanceof ZodError) {
+          logger.warn("Event update validation failed");
+          return res.status(400).json({ message: "Invalid event data", errors: error.errors });
+        }
+
+        res.status(500).json({ message: "Failed to update event" });
+      }
+    });
+
+    app.get("/api/events/:id/officials", async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        logger.debug("Fetching event officials");
+        const officials = await storage.getEventOfficials(id);
+        logger.debug("Fetched event officials", { count: officials.length });
+        res.json(officials);
+      } catch (error) {
+        logger.error("Event officials fetch failed");
+        res.status(500).json({ message: 'Failed to fetch event officials' });
+      }
+    });
+
+    app.get("/api/events/:id/teams", async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        logger.debug("Fetching event teams");
+        const teams = await storage.getEventTeams(id);
+        logger.debug("Fetched event teams", { count: teams.length });
+        res.json(teams);
+      } catch (error) {
+        logger.error("Event teams fetch failed");
+        res.status(500).json({ message: 'Failed to fetch event teams' });
+      }
+    });
+
+    // Update the event creation route to allow both Admin and Regional Supervisor roles
+    app.post("/api/events", isAuthenticated, async (req, res) => {
+      try {
+        if (!req.user) {
+          logger.warn("Event creation missing authenticated user");
+          return res.status(401).json({ message: "Authentication required. Please log in again." });
+        }
+
+        // Check if user is Admin or Regional Supervisor
+        const isAdmin = req.user.role === 'admin';
+        const supervisorAuthorized = isRegionalSupervisor(req.user);
+
+        if (!isAdmin && !supervisorAuthorized) {
+          logger.warn("Event creation authorization denied");
+          return res.status(403).json({ message: "Only Admins and Regional Supervisors can create events" });
+        }
+
+        // Validate event data
+        const event = insertEventSchema.parse({
+          ...req.body,
+          region: isAdministrator(req.user) ? req.body.region : req.user.region,
+        });
+        if (!(await eventResourcesAreAuthorized(req, event))) {
+          return res.status(403).json({ message: "Event resources must be in your region" });
+        }
+
+        // Ensure at least one official is assigned
+        if (!event.officials || event.officials.length === 0) {
+          return res.status(400).json({ message: "At least one official must be assigned to the event" });
+        }
+
+        // Create the event
+        const created = await storage.createEvent(event);
+        res.status(201).json(created);
+      } catch (e) {
+        if (e instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid event data", errors: e.errors });
+        }
+        logger.error("Event creation failed");
+        res.status(500).json({ message: e instanceof Error ? e.message : "Failed to create event" });
+      }
+    });
+
+    app.post("/api/officials", isAuthenticated, isAdmin, async (req, res) => {
+      try {
+        logger.debug("Official creation started");
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
+
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        // Convert fields to the correct types with validation
+        const officialData = {
+          firstName: fields.firstName?.[0]?.trim() || '',
+          lastName: fields.lastName?.[0]?.trim() || '',
+          age: parseInt(fields.age?.[0] || '0'),
+          location: fields.location?.[0]?.trim() || '',
+          association: fields.association?.[0]?.trim() || '',
+          yearsExperience: parseInt(fields.yearsExperience?.[0] || '0'),
+        };
+
+        // Validate required fields before schema parsing
+        if (!officialData.firstName || !officialData.lastName) {
+          return res.status(400).json({ message: "First name and last name are required" });
+        }
+
+        if (isNaN(officialData.age) || officialData.age <= 0) {
+          return res.status(400).json({ message: "Valid age is required" });
+        }
+
+        if (isNaN(officialData.yearsExperience) || officialData.yearsExperience < 0) {
+          return res.status(400).json({ message: "Valid years of experience is required" });
+        }
+
+        const official = insertOfficialSchema.parse(officialData);
+
+        // Decode and normalize image bytes before publishing them.
+        let photoUrl: string | undefined;
+        if (files.photo) {
+          const photo = firstFile(files, "photo");
+          if (photo && photo.size > 0) {
+            try {
+              photoUrl = (await saveImage(photo)).url;
+            } catch (error) {
+              if (error instanceof UploadError) return res.status(error.statusCode).json({ message: error.message });
+              throw error;
+            }
+          }
+        }
+
+        const created = await storage.createOfficial({ ...official, photoUrl });
+        logger.info("Official created");
+
+        res.status(201).json(created);
+      } catch (e) {
+        logger.error("Official creation failed");
+        if (e instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid official data", errors: e.errors });
+        }
+        res.status(500).json({ message: e instanceof Error ? e.message : "Failed to create official" });
+      }
+    });
+
+    app.patch("/api/officials/:id", isAuthenticated, isAdmin, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        logger.debug("Official update started");
+
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
+
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        // Convert fields to the correct types
+        const officialData: Partial<InsertOfficial> & { photoUrl?: string } = {};
+
+        if (fields.firstName?.[0]) officialData.firstName = fields.firstName[0].trim();
+        if (fields.lastName?.[0]) officialData.lastName = fields.lastName[0].trim();
+        if (fields.age?.[0]) officialData.age = parseInt(fields.age[0]);
+        if (fields.location?.[0]) officialData.location = fields.location[0].trim();
+        if (fields.association?.[0]) officialData.association = fields.association[0].trim();
+        if (fields.yearsExperience?.[0]) officialData.yearsExperience = parseInt(fields.yearsExperience[0]);
+
+        // Decode and normalize image bytes before publishing them.
+        if (files.photo) {
+          const photo = firstFile(files, "photo");
+
+          if (photo && photo.size > 0) {
+            try {
+              officialData.photoUrl = (await saveImage(photo)).url;
+            } catch (error) {
+              if (error instanceof UploadError) return res.status(error.statusCode).json({ message: error.message });
+              throw error;
+            }
+          }
+        }
+
+        logger.debug("Updating official");
+        const updated = await storage.updateOfficial(id, officialData);
+        logger.info("Official updated");
+
+        res.json(updated);
+      } catch (e) {
+        logger.error("Official update failed");
+        if (e instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid official data", errors: e.errors });
+        }
+        res.status(500).json({ message: e instanceof Error ? e.message : "Failed to update official" });
+      }
+    });
+
+    app.post("/api/reviews/:id/report", isAuthenticated, async (req, res) => {
+      const id = parseInt(req.params.id);
+      await storage.reportReview(id);
+      res.status(200).json({ message: "Review reported" });
+    });
+
+    // Add endpoint to delete a review (admin and supervisor only)
+    app.delete("/api/reviews/:id", isAuthenticated, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+
+        // Check if user is Admin or Regional Supervisor
+        const isAdmin = req.user?.role === 'admin';
+        const supervisorAuthorized = isRegionalSupervisor(req.user);
+
+        if (!isAdmin && !supervisorAuthorized) {
+          return res.status(403).json({
+            message: "Only Admins and Regional Supervisors can delete reviews"
+          });
+        }
+
+        const review = await storage.getReviewById(id);
+        if (!review) {
+          return res.status(404).json({ message: "Review not found" });
+        }
+        const official = await storage.getOfficialById(review.officialId);
+        if (!official || !canManageTargetRegion(req, res, official.association)) {
+          return;
+        }
+
+        await storage.deleteReview(id);
+        await deleteAsset(review.videoUrl);
+        res.status(200).json({ message: "Review deleted successfully" });
+      } catch (error) {
+        console.error('Error deleting review:', error);
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to delete review"
+        });
+      }
+    });
+
+    // Add this new route after your existing routes
+    app.get("/api/officials/:id/events", async (req, res) => {
+      const id = parseInt(req.params.id);
+      const events = await storage.getEventsForOfficial(id);
+      res.json(events);
+    });
+
+    // Add endpoint to get events for a coach based on their school/team
+    app.get("/api/coach/events", isAuthenticated, async (req, res) => {
+      try {
+        // Check if user is a Coach
+        if (req.user?.userType !== 'Coach') {
+          return res.status(403).json({ message: "Only Coaches can access this endpoint" });
+        }
+
+        const schoolName = req.user.school;
+        if (!schoolName) {
+          return res.status(400).json({ message: "School is not set in your profile" });
+        }
+
+        logger.debug("Fetching coach events");
+
+        // Get events for this coach's school/team
+        const events = await storage.getEventsForCoach(schoolName);
+
+        logger.debug("Fetched coach events", { count: events.length });
+
+        res.json(events);
+      } catch (error) {
+        console.error('Error fetching coach events:', error);
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to fetch events"
+        });
+      }
+    });
+
+    // Get all coaches (admin and supervisor endpoint)
+    app.get("/api/admin/coaches", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        logger.debug("Fetching managed coaches");
+        const coaches = filterToAuthorizedRegion(
+          req.user,
+          await storage.getUsersByType('Coach'),
+        );
+        // Sort coaches alphabetically by last name
+        coaches.sort((a, b) => a.lastName.localeCompare(b.lastName));
+        logger.debug("Fetched managed coaches", { count: coaches.length });
+        res.json(await withCoachNotificationStatus(db, coaches));
+      } catch (error) {
+        logger.error("Managed coaches fetch failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to fetch coaches"
+        });
+      }
+    });
+
+    // Create a new coach (admin endpoint) - same as supervisor endpoint
+    app.post("/api/admin/coaches", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        logger.debug("Admin coach creation started");
+        logger.debug("Coach creation requested");
+
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
+
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        // Extract and validate required fields
+        const firstName = fields.firstName?.[0]?.trim();
+        const lastName = fields.lastName?.[0]?.trim();
+        const email = fields.email?.[0]?.trim().toLowerCase();
+        const password = fields.password?.[0];
+        const school = fields.school?.[0]?.trim();
+
+        logger.debug("Admin coach fields parsed");
+
+        if (!firstName || !lastName || !email || !password || !school) {
+          logger.warn("Admin coach creation missing required fields");
+          return res.status(400).json({ message: "All required fields must be provided" });
+        }
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          logger.warn("Invalid email format on coach creation");
+          return res.status(400).json({ message: "Invalid email format" });
+        }
+
+        // Check if email already exists
+        logger.debug("Checking coach email availability");
+        const existingUser = await storage.getUserByEmail(email);
+        if (existingUser) {
+          logger.warn("Coach email already exists");
+          return res.status(400).json({ message: "A user with this email already exists" });
+        }
+
+        // Parse years coaching with validation
+        let yearsCoaching = 0;
+        if (fields.yearsCoaching?.[0]) {
+          const parsed = parseInt(fields.yearsCoaching[0], 10);
+          yearsCoaching = !isNaN(parsed) && parsed >= 0 ? parsed : 0;
+        }
+        logger.debug("Admin coach years parsed");
+
+        // Add school to teams if it doesn't exist
+        logger.debug("Managing coach team assignment");
+        try {
+          const existingTeams = await storage.getTeams();
+          const teamExists = existingTeams.some(team =>
+            team.name.toLowerCase() === school.toLowerCase()
+          );
+          if (!teamExists) {
+            logger.debug("Creating coach team");
+            await storage.createTeam({
+              name: school,
+              region: isRegionalSupervisor(req.user) ? req.user?.region : null,
+            });
+            logger.info("Coach team created");
+          } else {
+            logger.debug("Coach team already exists");
+          }
+        } catch (teamError) {
+          logger.warn("Coach team management failed");
+          // Don't fail coach creation if team creation fails
+        }
+
+        // Create the coach user
+        const coachData = {
+          firstName,
+          lastName,
+          email,
+          password,
+          confirmPassword: password,
+          userType: 'Coach' as const,
+          school,
+          yearsCoaching,
+          isVerified: true,
+          region: isRegionalSupervisor(req.user) ? req.user?.region : null,
+        };
+
+        logger.debug("Creating administrator-managed coach");
+
+        const coach = await storage.createUser(coachData);
+        logger.info("Administrator-managed coach created");
+
+        // Handle optional photo upload before sending response
+        const photoFile = firstFile(files, "photo");
+        if (photoFile && photoFile.size > 0) {
+          logger.debug("Processing coach photo upload");
+          try {
+            const photoUrl = (await saveImage(photoFile)).url;
+
+            const updatedCoach = await storage.updateUserProfile(coach.id, { photoUrl });
+            logger.info("Coach photo updated");
+
+            // Clean up temp file
+            try {
+              await fs.unlink(photoFile.filepath);
+              logger.debug("Temporary upload cleaned up");
+            } catch (cleanupError) {
+              logger.warn("Temporary upload cleanup failed");
+            }
+
+            // Return updated coach with photo URL
+            logger.info("Admin coach creation completed");
+            return res.status(201).json(updatedCoach);
+          } catch (photoError) {
+            logger.warn("Coach photo processing failed");
+            // Photo processing failed, but coach was created successfully
+          }
+        } else {
+          logger.debug("Coach created without photo");
+        }
+
+        // Return coach (with or without photo, depending on upload success)
+        logger.info("Admin coach creation completed");
+        return res.status(201).json(coach);
+      } catch (error) {
+        logger.error("Admin coach creation failed");
+        return res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to create coach"
+        });
+      }
+    });
+
+    // Supervisor endpoint for coaches - same as admin, no region filtering
+    app.get("/api/supervisor/coaches", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        logger.debug("Fetching managed coaches");
+        const coaches = filterToAuthorizedRegion(
+          req.user,
+          await storage.getUsersByType('Coach'),
+        );
+        logger.debug("Fetched managed coaches", { count: coaches.length });
+        res.json(await withCoachNotificationStatus(db, coaches));
+      } catch (error) {
+        logger.error("Managed coaches fetch failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to fetch coaches"
+        });
+      }
+    });
+
+    // Create a new coach (supervisor endpoint)
+    app.post("/api/supervisor/coaches", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        logger.debug("Supervisor coach creation started");
+        logger.debug("Supervisor coach creation requested");
+
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
+
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        // Extract and validate required fields
+        const firstName = fields.firstName?.[0]?.trim();
+        const lastName = fields.lastName?.[0]?.trim();
+        const email = fields.email?.[0]?.trim().toLowerCase();
+        const password = fields.password?.[0];
+        const school = fields.school?.[0]?.trim();
+
+        logger.debug("Supervisor coach fields parsed");
+
+        if (!firstName || !lastName || !email || !password || !school) {
+          logger.warn("Supervisor coach creation missing required fields");
+          return res.status(400).json({ message: "All required fields must be provided" });
+        }
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          logger.warn("Invalid email format on coach creation");
+          return res.status(400).json({ message: "Invalid email format" });
+        }
+
+        // Check if email already exists
+        logger.debug("Checking coach email availability");
+        const existingUser = await storage.getUserByEmail(email);
+        if (existingUser) {
+          logger.warn("Coach email already exists");
+          return res.status(400).json({ message: "A user with this email already exists" });
+        }
+
+        // Parse years coaching with validation
+        let yearsCoaching = 0;
+        if (fields.yearsCoaching?.[0]) {
+          const parsed = parseInt(fields.yearsCoaching[0], 10);
+          yearsCoaching = !isNaN(parsed) && parsed >= 0 ? parsed : 0;
+        }
+        logger.debug("Supervisor coach years parsed");
+
+        // Add school to teams if it doesn't exist
+        logger.debug("Managing coach team assignment");
+        try {
+          const existingTeams = await storage.getTeams();
+          const teamExists = existingTeams.some(team =>
+            team.name.toLowerCase() === school.toLowerCase()
+          );
+          if (!teamExists) {
+            logger.debug("Creating coach team");
+            await storage.createTeam({
+              name: school,
+              region: isRegionalSupervisor(req.user) ? req.user?.region : null,
+            });
+            logger.info("Coach team created");
+          } else {
+            logger.debug("Coach team already exists");
+          }
+        } catch (teamError) {
+          logger.warn("Coach team management failed");
+          // Don't fail coach creation if team creation fails
+        }
+
+        // Create the coach user
+        const coachData = {
+          firstName,
+          lastName,
+          email,
+          password,
+          confirmPassword: password,
+          userType: 'Coach' as const,
+          school,
+          yearsCoaching,
+          isVerified: true,
+          region: isRegionalSupervisor(req.user) ? req.user?.region : null,
+        };
+
+        logger.debug("Creating supervisor-managed coach");
+
+        const coach = await storage.createUser(coachData);
+        logger.info("Supervisor-managed coach created");
+
+        // Handle optional photo upload before sending response
+        const photoFile = firstFile(files, "photo");
+        if (photoFile && photoFile.size > 0) {
+          logger.debug("Processing coach photo upload");
+          try {
+            const photoUrl = (await saveImage(photoFile)).url;
+
+            const updatedCoach = await storage.updateUserProfile(coach.id, { photoUrl });
+            logger.info("Coach photo updated");
+
+            // Clean up temp file
+            try {
+              await fs.unlink(photoFile.filepath);
+              logger.debug("Temporary upload cleaned up");
+            } catch (cleanupError) {
+              logger.warn("Temporary upload cleanup failed");
+            }
+
+            // Return updated coach with photo URL
+            logger.info("Supervisor coach creation completed");
+            return res.status(201).json(updatedCoach);
+          } catch (photoError) {
+            logger.warn("Coach photo processing failed");
+            // Photo processing failed, but coach was created successfully
+          }
+        } else {
+          logger.debug("Coach created without photo");
+        }
+
+        // Return coach (with or without photo, depending on upload success)
+        logger.info("Supervisor coach creation completed");
+        return res.status(201).json(coach);
+      } catch (error) {
+        logger.error("Supervisor coach creation failed");
+        return res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to create coach"
+        });
+      }
+    });
+
+    // Supervisor coach update endpoint
+    app.patch("/api/supervisor/coaches/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        const targetCoach = await storage.getUserById(id);
+        if (!targetCoach) {
+          return res.status(404).json({ message: "Coach not found" });
+        }
+        if (!canManageTargetRegion(req, res, targetCoach.region)) {
+          return;
+        }
+        logger.debug("Managed coach update started");
+
+        const uploadsDir = path.join(process.cwd(), "uploads");
+        await fs.mkdir(uploadsDir, { recursive: true });
+
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        const updates: Partial<User> = {};
+
+        if (fields.firstName?.[0]) updates.firstName = fields.firstName[0];
+        if (fields.lastName?.[0]) updates.lastName = fields.lastName[0];
+        if (fields.email?.[0]) updates.email = fields.email[0];
+        if (fields.school?.[0]) updates.school = fields.school[0];
+        if (isAdministrator(req.user) && fields.region?.[0]) {
+          updates.region = fields.region[0];
+        }
+
         if (fields.yearsCoaching?.[0]) {
           const yearsCoaching = parseInt(fields.yearsCoaching[0], 10);
-          if (!isNaN(yearsCoaching)) {
-            updates.yearsCoaching = yearsCoaching;
+          if (!isNaN(yearsCoaching)) updates.yearsCoaching = yearsCoaching;
+        }
+
+        if (files.photo) {
+          const photo = firstFile(files, "photo");
+          if (photo && photo.size > 0) {
+            try {
+              updates.photoUrl = (await saveImage(photo)).url;
+            } catch (error) {
+              if (error instanceof UploadError) return res.status(error.statusCode).json({ message: error.message });
+              logger.error("Managed coach photo processing failed");
+              return res.status(500).json({ message: "Error processing uploaded photo" });
+            }
           }
         }
-      } else if (req.user?.userType === "Regional Supervisor") {
-        if (fields.region?.[0]) updates.region = fields.region[0];
-        if (fields.yearsExperience?.[0]) {
-          const yearsExperience = parseInt(fields.yearsExperience[0], 10);
-          if (!isNaN(yearsExperience)) {
-            updates.yearsExperience = yearsExperience;
-          }
-        }
-      }
 
-      // Handle photo upload
-      if (files.photo) {
-        const photo = Array.isArray(files.photo) ? files.photo[0] : files.photo;
-        if (photo.size > 0) {
-          updates.photoUrl = `/${path.relative(process.cwd(), photo.filepath)}`;
-        }
-      }
-
-      console.log('Updating user profile with:', updates);
-      const updatedUser = await storage.updateUserProfile(req.user!.id, updates);
-      console.log('Profile update successful:', updatedUser);
-
-      // Update session data to reflect changes
-      if (req.user) {
-        Object.assign(req.user, updatedUser);
-      }
-
-      res.json(updatedUser);
-    } catch (error) {
-      console.error('Profile update error:', error);
-      res.status(500).json({
-        message: error instanceof Error ? error.message : "Failed to update profile"
-      });
-    }
-  });
-
-  // Protected routes that require authentication 
-  app.post("/api/officials/:id/reviews", isAuthenticated, async (req, res) => {
-    try {
-      const officialId = parseInt(req.params.id);
-      const reviewData = {
-        ...req.body,
-        officialId,
-        userId: req.user!.id // Ensure we have the user ID from the authenticated session
-      };
-
-      const review = insertReviewSchema.parse({ ...reviewData, officialId });
-      const created = await storage.createReview({ ...review, userId: req.user!.id });
-      res.status(201).json(created);
-    } catch (e) {
-      if (e instanceof ZodError) {
-        return res.status(400).json({ message: "Invalid review data", errors: e.errors });
-      }
-      console.error('Review creation error:', e);
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  // Existing routes...
-  app.get("/api/officials", async (_req, res) => {
-    console.log('GET /api/officials - Fetching all officials');
-    const officials = await storage.getOfficials();
-    console.log('Officials found:', officials);
-    res.json(officials);
-  });
-
-  app.get("/api/officials/search", async (req, res) => {
-    const query = req.query.q as string;
-    if (!query) {
-      return res.status(400).json({ message: "Search query required" });
-    }
-    const results = await storage.searchOfficials(query);
-    res.json(results);
-  });
-
-  app.get("/api/officials/:id", async (req, res) => {
-    const id = parseInt(req.params.id);
-    const official = await storage.getOfficialById(id);
-    if (!official) {
-      return res.status(404).json({ message: "Official not found" });
-    }
-    res.json(official);
-  });
-  
-  // Get reviews for an official
-  app.get("/api/officials/:id/reviews", async (req, res) => {
-    try {
-      const officialId = parseInt(req.params.id);
-      const reviews = await storage.getReviewsForOfficial(officialId);
-      res.json(reviews);
-    } catch (error) {
-      console.error('Error fetching reviews:', error);
-      res.status(500).json({ message: "Failed to fetch reviews" });
-    }
-  });
-
-  app.get("/api/events", async (_req, res) => {
-    const events = await storage.getEvents();
-    res.json(events);
-  });
-
-  app.get("/api/events/search", async (req, res) => {
-    const query = req.query.q as string;
-    const filters = {
-      startDate: req.query.startDate ? new Date(req.query.startDate as string) : undefined,
-      endDate: req.query.endDate ? new Date(req.query.endDate as string) : undefined,
-      eventType: req.query.eventType as string,
-      venue: req.query.venue as string,
-      host: req.query.host as string
-    };
-
-    if (!query && !Object.values(filters).some(v => v !== undefined)) {
-      return res.status(400).json({ message: "Search query or filters required" });
-    }
-
-    const results = await storage.searchEvents(query || "", filters);
-    res.json(results);
-  });
-
-  app.get("/api/events/:id", async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      const event = await storage.getEventById(id);
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-
-      // Get officials assigned to this event
-      const officials = await storage.getEventOfficials(id);
-
-      res.json({
-        ...event,
-        officials: officials.map(official => ({
-          officialId: official.id,
-          firstName: official.firstName,
-          lastName: official.lastName,
-          role: official.role
-        }))
-      });
-    } catch (error) {
-      console.error('Error fetching event:', error);
-      res.status(500).json({ message: "Failed to fetch event details" });
-    }
-  });
-
-  app.put("/api/events/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-
-      // Check if user is Admin or Regional Supervisor
-      const isAdmin = req.user?.role === 'admin';
-      const isRegionalSupervisor = req.user?.userType === 'Regional Supervisor';
-
-      if (!isAdmin && !isRegionalSupervisor) {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can update events" });
-      }
-
-      // Validate event data
-      const event = insertEventSchema.parse(req.body);
-
-      // Ensure at least one official is assigned
-      if (!event.officials || event.officials.length === 0) {
-        return res.status(400).json({ message: "At least one official must be assigned to the event" });
-      }
-
-      // Update the event
-      const updatedEvent = await storage.updateEvent(id, event);
-      res.json(updatedEvent);
-    } catch (error) {
-      console.error('Error updating event:', error);
-      if (error instanceof ZodError) {
-        return res.status(400).json({ message: "Invalid event data", errors: error.errors });
-      }
-      res.status(500).json({ message: error instanceof Error ? error.message : "Failed to update event" });
-    }
-  });
-  
-  // Add PATCH endpoint for updating events (for compatibility with the frontend)
-  app.patch("/api/events/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      console.log('PATCH /api/events/:id - Event ID:', id, 'User:', {
-        id: req.user?.id,
-        email: req.user?.email,
-        role: req.user?.role,
-        userType: req.user?.userType
-      });
-
-      // Check if user is Admin or Regional Supervisor
-      const isAdmin = req.user?.role === 'admin';
-      const isRegionalSupervisor = req.user?.userType === 'Regional Supervisor';
-
-      if (!isAdmin && !isRegionalSupervisor) {
-        console.warn('Authorization failed for event update:', {
-          userId: req.user?.id,
-          role: req.user?.role,
-          userType: req.user?.userType
-        });
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can update events" });
-      }
-
-      // Validate event data
-      console.log('Validating event data:', {
-        name: req.body.name,
-        date: req.body.date,
-        teams: req.body.teams?.length || 0,
-        officials: req.body.officials?.length || 0
-      });
-      
-      const event = insertEventSchema.parse(req.body);
-
-      // Ensure at least one official is assigned
-      if (!event.officials || event.officials.length === 0) {
-        console.warn('Event update validation failed: No officials assigned', {
-          eventId: id,
-          userId: req.user?.id
-        });
-        return res.status(400).json({ message: "At least one official must be assigned to the event" });
-      }
-
-      // Update the event
-      console.log('Calling storage.updateEvent for event ID:', id);
-      const updatedEvent = await storage.updateEvent(id, event);
-      console.log('Event successfully updated:', {
-        id: updatedEvent.id,
-        name: updatedEvent.name,
-        date: updatedEvent.date
-      });
-      
-      res.json(updatedEvent);
-    } catch (error) {
-      console.error('Error updating event:', error);
-      
-      if (error instanceof ZodError) {
-        const zodErrors = error.errors.map(e => ({
-          path: e.path,
-          message: e.message
-        }));
-        console.error('ZodError validation failed:', zodErrors);
-        return res.status(400).json({ message: "Invalid event data", errors: error.errors });
-      }
-      
-      const errorMessage = error instanceof Error ? error.message : "Failed to update event";
-      console.error('Server error in event update:', {
-        message: errorMessage,
-        stack: error instanceof Error ? error.stack : 'No stack trace'
-      });
-      
-      res.status(500).json({ message: errorMessage });
-    }
-  });
-
-  app.get("/api/events/:id/officials", async (req, res) => {
-    const id = parseInt(req.params.id);
-    const officials = await storage.getEventOfficials(id);
-    res.json(officials);
-  });
-
-  // Update the event creation route to allow both Admin and Regional Supervisor roles
-  app.post("/api/events", isAuthenticated, async (req, res) => {
-    try {
-      console.log('Creating event, user:', {
-        id: req.user?.id,
-        role: req.user?.role,
-        userType: req.user?.userType,
-        email: req.user?.email
-      });
-
-      // Check if user is Admin or Regional Supervisor
-      const isAdmin = req.user?.role === 'admin';
-      const isRegionalSupervisor = req.user?.userType === 'Regional Supervisor';
-
-      if (!isAdmin && !isRegionalSupervisor) {
-        console.log('Authorization failed:', {
-          role: req.user?.role,
-          userType: req.user?.userType,
-          condition: !isAdmin && !isRegionalSupervisor
-        });
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can create events" });
-      }
-
-      // Validate event data
-      const event = insertEventSchema.parse(req.body);
-
-      // Ensure at least one official is assigned
-      if (!event.officials || event.officials.length === 0) {
-        return res.status(400).json({ message: "At least one official must be assigned to the event" });
-      }
-
-      // Create the event
-      const created = await storage.createEvent(event);
-      res.status(201).json(created);
-    } catch (e) {
-      if (e instanceof ZodError) {
-        return res.status(400).json({ message: "Invalid event data", errors: e.errors });
-      }
-      console.error('Event creation error:', e);
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  app.post("/api/officials", isAuthenticated, isAdmin, async (req, res) => {
-    try {
-      console.log('Starting file upload processing...');
-      const uploadsDir = path.join(process.cwd(), "uploads");
-      await fs.mkdir(uploadsDir, { recursive: true });
-
-      const form = formidable({
-        maxFileSize: 5 * 1024 * 1024, // 5MB limit
-        uploadDir: uploadsDir,
-        keepExtensions: true,
-      });
-
-      const [fields, files] = await new Promise<[formidable.Fields, formidable.Files]>((resolve, reject) => {
-        form.parse(req, (err, fields, files) => {
-          if (err) {
-            console.error('Error parsing form:', err);
-            reject(err);
-          }
-          console.log('Form parsed successfully:', { fields: Object.keys(fields), files: Object.keys(files) });
-          resolve([fields, files]);
-        });
-      });
-
-      // Convert fields to the correct types
-      const officialData = {
-        firstName: fields.firstName[0],
-        lastName: fields.lastName[0],
-        age: parseInt(fields.age[0]),
-        location: fields.location[0],
-        association: fields.association[0],
-        yearsExperience: parseInt(fields.yearsExperience[0]),
-      };
-
-      const official = insertOfficialSchema.parse(officialData);
-
-      // Handle photo upload
-      let photoUrl = null;
-      if (files.photo) {
-        const photo = Array.isArray(files.photo) ? files.photo[0] : files.photo;
-        // Use relative path for storage
-        photoUrl = path.relative(process.cwd(), photo.filepath);
-        console.log('Photo saved:', photoUrl);
-      }
-
-      const created = await storage.createOfficial({ ...official, photoUrl });
-      console.log('Official created successfully:', created);
-      res.status(201).json(created);
-    } catch (e) {
-      console.error('Error in /api/officials:', e);
-      if (e instanceof ZodError) {
-        return res.status(400).json({ message: "Invalid official data", errors: e.errors });
-      }
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  app.get("/api/officials/:id/reviews", async (req, res) => {
-    const id = parseInt(req.params.id);
-    const reviews = await storage.getReviewsForOfficial(id);
-    res.json(reviews);
-  });
-
-  app.post("/api/reviews/:id/report", isAuthenticated, async (req, res) => {
-    const id = parseInt(req.params.id);
-    await storage.reportReview(id);
-    res.status(200).json({ message: "Review reported" });
-  });
-  
-  // Add endpoint to delete a review (admin and supervisor only)
-  app.delete("/api/reviews/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Admin or Regional Supervisor
-      const isAdmin = req.user?.role === 'admin';
-      const isRegionalSupervisor = req.user?.userType === 'Regional Supervisor';
-      
-      if (!isAdmin && !isRegionalSupervisor) {
-        return res.status(403).json({ 
-          message: "Only Admins and Regional Supervisors can delete reviews"
+        logger.debug("Updating coach profile");
+        const updatedCoach = await storage.updateUserProfile(id, updates, true);
+        res.json(updatedCoach);
+      } catch (error) {
+        logger.error("Managed coach update failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to update coach"
         });
       }
-      
-      await storage.deleteReview(id);
-      res.status(200).json({ message: "Review deleted successfully" });
-    } catch (error) {
-      console.error('Error deleting review:', error);
-      res.status(500).json({ 
-        message: error instanceof Error ? error.message : "Failed to delete review" 
-      });
-    }
-  });
+    });
 
-  // Add this new route after your existing routes
-  app.get("/api/officials/:id/events", async (req, res) => {
-    const id = parseInt(req.params.id);
-    const events = await storage.getEventsForOfficial(id);
-    res.json(events);
-  });
-  
-  // Add endpoint to get events for a coach based on their school/team
-  app.get("/api/coach/events", isAuthenticated, async (req, res) => {
-    try {
-      // Check if user is a Coach
-      if (req.user?.userType !== 'Coach') {
-        return res.status(403).json({ message: "Only Coaches can access this endpoint" });
-      }
-
-      const schoolName = req.user.school;
-      if (!schoolName) {
-        return res.status(400).json({ message: "School is not set in your profile" });
-      }
-      
-      console.log(`Fetching events for coach with school: ${schoolName}`);
-      
-      // Get events for this coach's school/team
-      const events = await storage.getEventsForCoach(schoolName);
-      
-      console.log(`Found ${events.length} events for school: ${schoolName}`);
-      
-      res.json(events);
-    } catch (error) {
-      console.error('Error fetching coach events:', error);
-      res.status(500).json({ message: "Failed to fetch events" });
-    }
-  });
-
-  // Add the PATCH route after the other official routes
-  app.patch("/api/officials/:id", isAuthenticated, isAdmin, async (req, res) => {
-    try {
-      console.log('Starting official update processing...');
-      const id = parseInt(req.params.id);
-      const uploadsDir = path.join(process.cwd(), "uploads");
-      await fs.mkdir(uploadsDir, { recursive: true });
-
-      const form = formidable({
-        maxFileSize: 5 * 1024 * 1024, // 5MB limit
-        uploadDir: uploadsDir,
-        keepExtensions: true,
-      });
-
-      const [fields, files] = await new Promise<[formidable.Fields, formidable.Files]>((resolve, reject) => {
-        form.parse(req, (err, fields, files) => {
-          if (err) {
-            console.error('Error parsing form:', err);
-            reject(err);
-          }
-          console.log('Form parsed successfully:', { fields: Object.keys(fields), files: Object.keys(files) });
-          resolve([fields, files]);
-        });
-      });
-
-      // Convert fields to the correct types
-      const officialData = {
-        firstName: fields.firstName[0],
-        lastName: fields.lastName[0],
-        age: parseInt(fields.age[0]),
-        location: fields.location[0],
-        association: fields.association[0],
-        yearsExperience: parseInt(fields.yearsExperience[0]),
-      };
-
-      const official = insertOfficialSchema.parse(officialData);
-
-      // Handle photo upload
-      let photoUrl = undefined;
-      if (files.photo) {
-        const photo = Array.isArray(files.photo) ? files.photo[0] : files.photo;
-        // Use relative path for storage
-        photoUrl = path.relative(process.cwd(), photo.filepath);
-        console.log('Photo saved:', photoUrl);
-      }
-
-      const updated = await storage.updateOfficial(id, { ...official, photoUrl: photoUrl ? `/${photoUrl}` : undefined });
-      console.log('Official updated successfully:', updated);
-      res.json(updated);
-    } catch (e) {
-      console.error('Error in PATCH /api/officials/:id:', e);
-      if (e instanceof ZodError) {
-        return res.status(400).json({ message: "Invalid official data", errors: e.errors });
-      }
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  // Add the delete route after the other official routes
-  app.delete("/api/officials/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-
-      // Check if user is Admin or Regional Supervisor
-      const isAdmin = req.user?.role === 'admin';
-      const isRegionalSupervisor = req.user?.userType === 'Regional Supervisor';
-
-      if (!isAdmin && !isRegionalSupervisor) {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can delete officials" });
-      }
-
-      await storage.deleteOfficial(id);
-      res.status(204).end();
-    } catch (error) {
-      console.error('Error deleting official:', error);
-      res.status(500).json({ message: "Failed to delete official" });
-    }
-  });
-
-  // Add this route after the other event routes
-  app.delete("/api/events/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-
-      // Check if user is Admin or Regional Supervisor
-      const isAdmin = req.user?.role === 'admin';
-      const isRegionalSupervisor = req.user?.userType === 'Regional Supervisor';
-
-      if (!isAdmin && !isRegionalSupervisor) {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can delete events" });
-      }
-
-      await storage.deleteEvent(id);
-      res.status(200).json({ message: "Event deleted successfully" });
-    } catch (error) {
-      console.error('Error deleting event:', error);
-      res.status(500).json({ message: "Failed to delete event" });
-    }
-  });
-
-  // Add endpoint to refresh all official ratings
-  app.post("/api/admin/refresh-ratings", isAuthenticated, async (req, res) => {
-    try {
-      // Check if user is Admin
-      if (req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Only Admins can refresh all ratings" });
-      }
-
-      console.log("Starting refresh of all official ratings");
-      await storage.refreshAllOfficialRatings();
-      console.log("Completed refresh of all official ratings");
-      
-      res.status(200).json({ message: "All official ratings have been refreshed successfully" });
-    } catch (error) {
-      console.error('Error refreshing official ratings:', error);
-      res.status(500).json({ message: "Failed to refresh official ratings" });
-    }
-  });
-
-  // Coach management endpoints for admin
-  app.get("/api/admin/coaches", isAuthenticated, async (req, res) => {
-    try {
-      // Check if user is Admin or Regional Supervisor
-      if (req.user?.role !== 'admin' && req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can access coach management" });
-      }
-
-      // Get all verified coaches from the database
-      const coaches = await storage.getAllCoaches();
-
-      // Format the coaches for the frontend
-      const formattedCoaches = coaches.map(coach => ({
-        id: coach.id,
-        email: coach.email,
-        firstName: coach.firstName,
-        lastName: coach.lastName,
-        school: coach.school || null,
-        yearsCoaching: coach.yearsCoaching || null,
-        photoUrl: coach.photoUrl || null,
-        region: coach.region || null
-      }));
-
-      res.json(formattedCoaches);
-    } catch (error) {
-      console.error('Error fetching coaches:', error);
-      res.status(500).json({ message: "Failed to fetch coaches" });
-    }
-  });
-
-  // Coach management endpoints for supervisors
-  app.get("/api/supervisor/coaches", isAuthenticated, async (req, res) => {
-    try {
-      // Check if user is Regional Supervisor
-      if (req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Regional Supervisors can access this endpoint" });
-      }
-
-      // Get region from the supervisor's profile
-      const supervisorRegion = req.user.region;
-      if (!supervisorRegion) {
-        return res.status(400).json({ message: "Supervisor region is not set" });
-      }
-
-      // Get coaches filtered by the supervisor's region
-      const coaches = await storage.getCoachesByRegion(supervisorRegion);
-
-      // Format the coaches for the frontend
-      const formattedCoaches = coaches.map(coach => ({
-        id: coach.id,
-        email: coach.email,
-        firstName: coach.firstName,
-        lastName: coach.lastName,
-        school: coach.school || null,
-        yearsCoaching: coach.yearsCoaching || null,
-        photoUrl: coach.photoUrl || null,
-        region: coach.region || null
-      }));
-
-      res.json(formattedCoaches);
-    } catch (error) {
-      console.error('Error fetching coaches for supervisor:', error);
-      res.status(500).json({ message: "Failed to fetch coaches" });
-    }
-  });
-
-  // Update coach endpoint for admin
-  app.patch("/api/admin/coaches/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Admin or Regional Supervisor
-      if (req.user?.role !== 'admin' && req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can update coaches" });
-      }
-
-      // Validate the input
-      const { firstName, lastName, email, school, yearsCoaching, region } = req.body;
-      
-      // If school is updated, add it to teams if it doesn't exist already
-      if (school) {
-        try {
-          // Check if team already exists with this name
-          const existingTeams = await storage.getTeams();
-          const teamExists = existingTeams.some(team => 
-            team.name.toLowerCase() === school.toLowerCase()
-          );
-          
-          // If the team doesn't exist, create it
-          if (!teamExists) {
-            await storage.createTeam({ name: school });
-            console.log(`Created new team from coach's updated school by admin: ${school}`);
-          }
-        } catch (error) {
-          console.error('Error creating team from updated school:', error);
-          // Continue with user update even if team creation fails
-        }
-      }
-      
-      // Update the coach
-      const updatedCoach = await storage.updateUserProfile(id, {
-        firstName,
-        lastName,
-        email,
-        school,
-        region,
-        yearsCoaching: yearsCoaching ? parseInt(yearsCoaching) : null
-      });
-
-      res.json(updatedCoach);
-    } catch (error) {
-      console.error('Error updating coach:', error);
-      res.status(500).json({ message: "Failed to update coach" });
-    }
-  });
-
-  // Update coach endpoint for supervisors
-  app.patch("/api/supervisor/coaches/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Regional Supervisor
-      if (req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Regional Supervisors can update coaches" });
-      }
-
-      // Get supervisor's region
-      const supervisorRegion = req.user.region;
-      if (!supervisorRegion) {
-        return res.status(400).json({ message: "Supervisor region is not set" });
-      }
-
-      // Get the coach to ensure they're in the supervisor's region
-      const coach = await storage.getUserById(id);
-      if (!coach) {
-        return res.status(404).json({ message: "Coach not found" });
-      }
-
-      if (coach.region !== supervisorRegion) {
-        return res.status(403).json({ message: "You can only manage coaches in your region" });
-      }
-
-      // Validate the input
-      const { firstName, lastName, email, school, yearsCoaching } = req.body;
-      
-      // If school is updated, add it to teams if it doesn't exist already
-      if (school) {
-        try {
-          // Check if team already exists with this name
-          const existingTeams = await storage.getTeams();
-          const teamExists = existingTeams.some(team => 
-            team.name.toLowerCase() === school.toLowerCase()
-          );
-          
-          // If the team doesn't exist, create it
-          if (!teamExists) {
-            await storage.createTeam({ name: school });
-            console.log(`Created new team from coach's updated school by supervisor: ${school}`);
-          }
-        } catch (error) {
-          console.error('Error creating team from updated school:', error);
-          // Continue with user update even if team creation fails
-        }
-      }
-      
-      // Update the coach, but don't allow changing the region
-      const updatedCoach = await storage.updateUserProfile(id, {
-        firstName,
-        lastName,
-        email,
-        school,
-        yearsCoaching: yearsCoaching ? parseInt(yearsCoaching) : null
-      });
-
-      res.json(updatedCoach);
-    } catch (error) {
-      console.error('Error updating coach:', error);
-      res.status(500).json({ message: "Failed to update coach" });
-    }
-  });
-
-  // Delete coach endpoint for admin
-  app.delete("/api/admin/coaches/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Admin or Regional Supervisor
-      if (req.user?.role !== 'admin' && req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can delete coaches" });
-      }
-
-      // Delete the coach
-      await storage.deleteUser(id);
-      
-      res.json({ message: "Coach deleted successfully" });
-    } catch (error) {
-      console.error('Error deleting coach:', error);
-      res.status(500).json({ message: "Failed to delete coach" });
-    }
-  });
-
-  // Delete coach endpoint for supervisors
-  app.delete("/api/supervisor/coaches/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Regional Supervisor
-      if (req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Regional Supervisors can delete coaches" });
-      }
-
-      // Get supervisor's region
-      const supervisorRegion = req.user.region;
-      if (!supervisorRegion) {
-        return res.status(400).json({ message: "Supervisor region is not set" });
-      }
-
-      // Get the coach to ensure they're in the supervisor's region
-      const coach = await storage.getUserById(id);
-      if (!coach) {
-        return res.status(404).json({ message: "Coach not found" });
-      }
-
-      if (coach.region !== supervisorRegion) {
-        return res.status(403).json({ message: "You can only manage coaches in your region" });
-      }
-
-      // Delete the coach
-      await storage.deleteUser(id);
-      
-      res.json({ message: "Coach deleted successfully" });
-    } catch (error) {
-      console.error('Error deleting coach:', error);
-      res.status(500).json({ message: "Failed to delete coach" });
-    }
-  });
-
-  // Team routes
-  app.get("/api/teams", async (_req, res) => {
-    try {
-      const teams = await storage.getTeams();
-      res.json(teams);
-    } catch (error) {
-      console.error("Error fetching teams:", error);
-      res.status(500).json({ message: "Error fetching teams" });
-    }
-  });
-
-  app.get("/api/teams/:id", async (req, res) => {
-    try {
-      const teamId = parseInt(req.params.id);
-      const team = await storage.getTeamById(teamId);
-      if (!team) {
-        return res.status(404).json({ message: "Team not found" });
-      }
-      res.json(team);
-    } catch (error) {
-      console.error("Error fetching team:", error);
-      res.status(500).json({ message: "Error fetching team" });
-    }
-  });
-
-  app.post("/api/teams", isAuthenticated, isVerified, async (req, res) => {
-    try {
-      const team = await storage.createTeam(req.body);
-      res.status(201).json(team);
-    } catch (error) {
-      console.error("Error creating team:", error);
-      res.status(500).json({ message: "Error creating team" });
-    }
-  });
-  
-  // Update team
-  app.patch("/api/teams/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Admin or Regional Supervisor
-      if (req.user?.role !== 'admin' && req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can update teams" });
-      }
-
-      const team = await storage.updateTeam(id, req.body);
-      res.json(team);
-    } catch (error) {
-      console.error("Error updating team:", error);
-      res.status(500).json({ message: "Error updating team" });
-    }
-  });
-  
-  // Delete team
-  app.delete("/api/teams/:id", isAuthenticated, async (req, res) => {
-    try {
-      const id = parseInt(req.params.id);
-      
-      // Check if user is Admin or Regional Supervisor
-      if (req.user?.role !== 'admin' && req.user?.userType !== 'Regional Supervisor') {
-        return res.status(403).json({ message: "Only Admins and Regional Supervisors can delete teams" });
-      }
-      
-      await storage.deleteTeam(id);
-      res.json({ message: "Team deleted successfully" });
-    } catch (error) {
-      console.error("Error deleting team:", error);
-      res.status(500).json({ message: "Error deleting team" });
-    }
-  });
-
-  app.get("/api/events/:id/teams", async (req, res) => {
-    try {
-      const eventId = parseInt(req.params.id);
-      const teams = await storage.getEventTeams(eventId);
-      res.json(teams);
-    } catch (error) {
-      console.error("Error fetching event teams:", error);
-      res.status(500).json({ message: "Error fetching event teams" });
-    }
-  });
-
-  // Settings API endpoints
-  app.get("/api/settings", async (req, res) => {
-    try {
-      const settings = await storage.getAllSettings();
-      res.json(settings);
-    } catch (error) {
-      console.error("Error fetching settings:", error);
-      res.status(500).json({ message: "Error fetching settings" });
-    }
-  });
-
-  app.get("/api/settings/:key", async (req, res) => {
-    try {
-      const key = req.params.key;
-      const value = await storage.getSetting(key);
-      if (value === null) {
-        return res.status(404).json({ message: "Setting not found" });
-      }
-      res.json({ key, value });
-    } catch (error) {
-      console.error(`Error fetching setting ${req.params.key}:`, error);
-      res.status(500).json({ message: "Error fetching setting" });
-    }
-  });
-
-  app.post("/api/settings", isAuthenticated, async (req, res) => {
-    try {
-      // Only admins can update settings
-      if (req.user?.role !== 'admin') {
-        return res.status(403).json({ message: "Unauthorized" });
-      }
-      
-      const { key, value } = req.body;
-      if (!key || value === undefined) {
-        return res.status(400).json({ message: "Key and value are required" });
-      }
-      
-      const setting = await storage.updateSetting(key, value);
-      res.status(200).json(setting);
-    } catch (error) {
-      console.error("Error updating setting:", error);
-      res.status(500).json({ message: "Error updating setting" });
-    }
-  });
-
-  // User-specific settings routes
-  app.get("/api/user/settings", isAuthenticated, async (req, res) => {
-    try {
-      if (!req.user?.id) {
-        return res.status(401).json({ message: "Unauthorized" });
-      }
-      const userSettings = await storage.getUserSettings(req.user.id);
-      res.json(userSettings);
-    } catch (error) {
-      console.error("Error fetching user settings:", error);
-      res.status(500).json({ message: "Error fetching user settings" });
-    }
-  });
-
-  app.get("/api/user/settings/:key", isAuthenticated, async (req, res) => {
-    try {
-      if (!req.user?.id) {
-        return res.status(401).json({ message: "Unauthorized" });
-      }
-      const { key } = req.params;
-      const value = await storage.getUserSetting(req.user.id, key);
-      if (value === null) {
-        return res.status(404).json({ message: "Setting not found" });
-      }
-      res.json({ key, value });
-    } catch (error) {
-      console.error("Error fetching user setting:", error);
-      res.status(500).json({ message: "Error fetching user setting" });
-    }
-  });
-
-  app.post("/api/user/settings", isAuthenticated, async (req, res) => {
-    try {
-      if (!req.user?.id) {
-        return res.status(401).json({ message: "Unauthorized" });
-      }
-      const { key, value } = req.body;
-      if (!key) {
-        return res.status(400).json({ message: "Key is required" });
-      }
-
-      const updatedSetting = await storage.updateUserSetting(req.user.id, key, value);
-      res.json(updatedSetting);
-    } catch (error) {
-      console.error("Error updating user setting:", error);
-      res.status(500).json({ message: "Error updating user setting" });
-    }
-  });
-
-  // Upload background image
-  app.post("/api/settings/upload-background", isAuthenticated, async (req, res) => {
-    console.log('Background upload request from user:', req.user);
-    if (req.user?.role !== 'admin') {
-      console.log('User is not admin, role:', req.user?.role);
-      return res.status(403).json({ message: "Unauthorized" });
-    }
-
-    try {
-      // Use the newer formidable API
-      const form = formidable({
-        maxFileSize: 5 * 1024 * 1024, // 5MB limit
-        uploadDir: os.tmpdir(),
-        keepExtensions: true,
-      });
-      
-      // Parse the form using promises
-      const [fields, files] = await new Promise<[formidable.Fields, formidable.Files]>((resolve, reject) => {
-        form.parse(req, (err, fields, files) => {
-          if (err) {
-            console.error("Error parsing form:", err);
-            reject(err);
-            return;
-          }
-          resolve([fields, files]);
-        });
-      });
-
-      // Handle the uploaded file
-      const backgroundImage = files.backgroundImage;
-      if (!backgroundImage) {
-        return res.status(400).json({ message: "No background image provided" });
-      }
-
-      // Get the file object, which could be an array depending on formidable version
-      const fileObject = Array.isArray(backgroundImage) ? backgroundImage[0] : backgroundImage;
-
-      // Create uploads directory if it doesn't exist
-      const uploadsDir = path.join(process.cwd(), "uploads");
+    // Supervisor coach delete endpoint
+    app.delete("/api/supervisor/coaches/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
       try {
+        const id = parseInt(req.params.id);
+        const targetCoach = await storage.getUserById(id);
+        if (!targetCoach) {
+          return res.status(404).json({ message: "Coach not found" });
+        }
+        if (!canManageTargetRegion(req, res, targetCoach.region)) {
+          return;
+        }
+        logger.debug("Managed coach deletion started");
+        await storage.deleteUser(id);
+        res.json({ message: "Coach deleted successfully" });
+      } catch (error) {
+        logger.error("Managed coach deletion failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to delete coach"
+        });
+      }
+    });
+
+    // Update a coach (admin endpoint)
+    app.patch("/api/admin/coaches/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        const targetCoach = await storage.getUserById(id);
+        if (!targetCoach) {
+          return res.status(404).json({ message: "Coach not found" });
+        }
+        if (!canManageTargetRegion(req, res, targetCoach.region)) {
+          return;
+        }
+        logger.debug("Managed coach update started");
+
+        const uploadsDir = path.join(process.cwd(), "uploads");
         await fs.mkdir(uploadsDir, { recursive: true });
-      } catch (err) {
-        console.error("Error creating uploads directory:", err);
+
+        const { fields, files } = await parseImageMultipart(req, 10 * 1024 * 1024);
+
+        // Create updates object
+        const updates: Partial<User> = {};
+
+        if (fields.firstName?.[0]) updates.firstName = fields.firstName[0];
+        if (fields.lastName?.[0]) updates.lastName = fields.lastName[0];
+        if (fields.email?.[0]) updates.email = fields.email[0];
+        if (fields.school?.[0]) updates.school = fields.school[0];
+
+        if (fields.yearsCoaching?.[0]) {
+          const yearsCoaching = parseInt(fields.yearsCoaching[0], 10);
+          if (!isNaN(yearsCoaching)) updates.yearsCoaching = yearsCoaching;
+        }
+
+        // Handle photo upload
+        if (files.photo) {
+          const photo = firstFile(files, "photo");
+          if (photo && photo.size > 0) {
+            try {
+              updates.photoUrl = (await saveImage(photo)).url;
+            } catch (error) {
+              if (error instanceof UploadError) return res.status(error.statusCode).json({ message: error.message });
+              logger.error("Managed coach photo processing failed");
+              return res.status(500).json({ message: "Error processing uploaded photo" });
+            }
+          }
+        }
+
+        logger.debug("Updating coach profile");
+        const updatedCoach = await storage.updateUserProfile(id, updates, true);
+        res.json(updatedCoach);
+      } catch (error) {
+        logger.error("Managed coach update failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to update coach"
+        });
       }
+    });
 
-      // Generate a unique filename
-      const fileId = Date.now().toString(16) + Math.random().toString(16).slice(2);
-      
-      // Get either the originalFilename or the original name depending on formidable version
-      const originalName = fileObject.originalFilename || (fileObject as any).originalName || (fileObject as any).name || "image.jpg";
-      let extension = path.extname(originalName).toLowerCase();
-      
-      if (!extension) {
-        extension = ".jpg";  // Default extension
+    // Delete a coach (admin endpoint)
+    app.delete("/api/admin/coaches/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        const targetCoach = await storage.getUserById(id);
+        if (!targetCoach) {
+          return res.status(404).json({ message: "Coach not found" });
+        }
+        if (!canManageTargetRegion(req, res, targetCoach.region)) {
+          return;
+        }
+
+        logger.debug("Managed coach deletion started");
+
+        await storage.deleteUser(id);
+        res.json({ message: "Coach deleted successfully" });
+      } catch (error) {
+        logger.error("Managed coach deletion failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to delete coach"
+        });
       }
+    });
 
-      const filename = fileId + extension;
-      const filePath = path.join(uploadsDir, filename);
-
-      // Get the filepath
-      const sourcePath = fileObject.filepath || (fileObject as any).path;
-      
-      if (!sourcePath) {
-        console.error("No source path found in file object:", fileObject);
-        return res.status(500).json({ message: "Error processing uploaded file" });
+    // Get all teams
+    app.get("/api/teams", async (req, res) => {
+      try {
+        const teams = await storage.getTeams();
+        res.json(teams);
+      } catch (error) {
+        logger.error("Teams fetch failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to fetch teams"
+        });
       }
+    });
 
-      // Move the uploaded file to the uploads directory
-      await fs.copyFile(sourcePath, filePath);
-      console.log(`Copied image from ${sourcePath} to ${filePath}`);
-      
-      // Save the background image path in settings
-      const imagePath = `/uploads/${filename}`;
-      await storage.updateSetting("backgroundImage", imagePath);
-      
-      // Import the image analysis utility
-      const { analyzeAndSaveBackgroundBrightness } = require('./image-utils');
-      
-      // Analyze the image brightness in the background
-      analyzeAndSaveBackgroundBrightness(filePath)
-        .catch((err: Error) => console.error('Background analysis error:', err));
-      
-      res.status(200).json({ 
-        message: "Background image uploaded successfully",
-        backgroundImage: imagePath
+    // Official.association and User.region are the normalized jurisdiction
+    // boundary. Teams created by supervisors always inherit that boundary.
+    app.post("/api/teams", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const parsedTeam = insertTeamSchema.parse(req.body);
+        const requestedRegion = normalizeRegion(parsedTeam.region);
+        if (!isAdministrator(req.user) && !canManageRegion(req.user, req.user?.region)) {
+          return res.status(403).json({ message: "Forbidden for this region" });
+        }
+        const teamData = {
+          ...parsedTeam,
+          region: isAdministrator(req.user) ? requestedRegion : normalizeRegion(req.user!.region),
+        };
+        if (!isAdministrator(req.user) && !canManageRegion(req.user, teamData.region)) {
+          return res.status(403).json({ message: "Forbidden for this region" });
+        }
+        
+        // Check if team already exists to prevent duplicates
+        const existingTeams = await storage.getTeams();
+        const teamExists = existingTeams.some(team =>
+          team.name.toLowerCase() === teamData.name.toLowerCase()
+        );
+        
+        if (teamExists) {
+          return res.status(400).json({ message: "A team with this name already exists" });
+        }
+        
+        const team = await storage.createTeam(teamData);
+        res.status(201).json(team);
+      } catch (error) {
+        if (error instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid team data", errors: error.errors });
+        }
+        logger.error("Team creation failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to create team"
+        });
+      }
+    });
+
+    // Update a team
+    app.patch("/api/teams/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        const existingTeam = await storage.getTeamById(id);
+        if (!existingTeam) {
+          return res.status(404).json({ message: "Team not found" });
+        }
+        if (!canManageTargetRegion(req, res, existingTeam.region)) {
+          return;
+        }
+        const teamData = insertTeamSchema.parse(req.body);
+        if (!canManageTargetRegion(req, res, teamData.region)) {
+          return;
+        }
+        const team = await storage.updateTeam(id, teamData);
+        res.json(team);
+      } catch (error) {
+        if (error instanceof ZodError) {
+          return res.status(400).json({ message: "Invalid team data", errors: error.errors });
+        }
+        logger.error("Team update failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to update team"
+        });
+      }
+    });
+
+    // Delete a team
+    app.delete("/api/teams/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        const existingTeam = await storage.getTeamById(id);
+        if (!existingTeam) {
+          return res.status(404).json({ message: "Team not found" });
+        }
+        if (!canManageTargetRegion(req, res, existingTeam.region)) {
+          return;
+        }
+        await storage.deleteTeam(id);
+        res.json({ message: "Team deleted successfully" });
+      } catch (error) {
+        logger.error("Team deletion failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to delete team"
+        });
+      }
+    });
+
+    // Debug endpoint to check event-team associations
+    if (debugRoutesEnabled(isProduction)) {
+      app.get("/api/debug/event-teams", isAuthenticated, isAdmin, async (req, res) => {
+      try {
+        const { pool } = await import('./db');
+        const client = await pool.connect();
+        
+        // Get all event_teams records
+        const eventTeamsResult = await client.query('SELECT * FROM event_teams ORDER BY event_id');
+        
+        // Get all teams
+        const teamsResult = await client.query('SELECT * FROM teams ORDER BY id');
+        
+        // Get all events
+        const eventsResult = await client.query('SELECT id, name FROM events ORDER BY id');
+        
+        client.release();
+        
+        res.json({
+          event_teams: eventTeamsResult.rows,
+          teams: teamsResult.rows,
+          events: eventsResult.rows,
+          summary: {
+            total_event_teams: eventTeamsResult.rows.length,
+            total_teams: teamsResult.rows.length,
+            total_events: eventsResult.rows.length
+          }
+        });
+      } catch (error) {
+        console.error("Error fetching debug data:", error);
+        res.status(500).json({ message: "Error fetching debug data" });
+      }
       });
-    } catch (error) {
-      console.error("Error saving background image:", error);
-      res.status(500).json({ message: "Error saving background image" });
     }
-  });
 
-  const httpServer = createServer(app);
-  return httpServer;
-}
+    // Settings API endpoints removed - feature discontinued
 
-interface User {
-  id: number;
-  email: string;
-  firstName: string;
-  lastName: string;
-  role: string;
-  userType: string;
-  school?: string;
-  yearsCoaching?: number;
-  region?: string;
-  yearsExperience?: number;
-  photoUrl?: string;
-  isVerified: boolean;
-  verificationToken?: string;
+    // Change password endpoint
+    app.post("/api/users/change-password", isAuthenticated, async (req, res) => {
+      try {
+        const { currentPassword, newPassword } = req.body;
+
+        if (!currentPassword || !newPassword) {
+          return res.status(400).json({ message: "Current password and new password are required" });
+        }
+
+        if (newPassword.length < 8) {
+          return res.status(400).json({ message: "New password must be at least 8 characters long" });
+        }
+
+        // Verify current password
+        const user = await storage.getUserById(req.user!.id);
+        if (!user) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        const isValid = await bcrypt.compare(currentPassword, user.password);
+        if (!isValid) {
+          return res.status(401).json({ message: "Current password is incorrect" });
+        }
+
+        // Hash new password and update
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        await storage.updateUserPassword(req.user!.id, hashedPassword);
+
+        res.json({ message: "Password changed successfully" });
+      } catch (error) {
+        console.error("Error changing password:", error);
+        res.status(500).json({ message: "Failed to change password" });
+      }
+    });
+
+    // Delete event endpoint
+    app.delete("/api/events/:id", isAuthenticated, isAdminOrSupervisor, async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        logger.debug("Event deletion started");
+
+        if (isNaN(id)) {
+          logger.warn("Invalid event deletion target");
+          return res.status(400).json({ message: "Invalid event ID" });
+        }
+
+        // Check if event exists
+        const event = await storage.getEventById(id);
+        if (!event) {
+          logger.warn("Event deletion target not found");
+          return res.status(404).json({ message: "Event not found" });
+        }
+        if (!canManageTargetRegion(req, res, event.region)) {
+          return;
+        }
+
+        logger.debug("Deleting event");
+
+        // Delete the event
+        await storage.deleteEvent(id);
+        logger.info("Event deleted");
+
+        res.json({ 
+          message: "Event deleted successfully",
+          deletedEventId: id,
+          deletedEventName: event.name
+        });
+      } catch (error) {
+        logger.error("Event deletion failed");
+        res.status(500).json({
+          message: error instanceof Error ? error.message : "Failed to delete event"
+        });
+      }
+    });
+
+    // User-specific settings routes
+    app.get("/api/user/settings", isAuthenticated, async (req, res) => {
+      try {
+        if (!req.user?.id) {
+          return res.status(401).json({ message: "Unauthorized" });
+        }
+        const userSettings = await storage.getUserSettings(req.user.id);
+        res.json(userSettings);
+      } catch (error) {
+        console.error("Error fetching user settings:", error);
+        res.status(500).json({ message: "Error fetching user settings" });
+      }
+    });
+
+    app.get("/api/user/settings/:key", isAuthenticated, async (req, res) => {
+      try {
+        if (!req.user?.id) {
+          return res.status(401).json({ message: "Unauthorized" });
+        }
+        const { key } = req.params;
+        const value = await storage.getUserSetting(req.user.id, key);
+        if (value === null) {
+          return res.status(404).json({ message: "Setting not found" });
+        }
+        res.json({ key, value });
+      } catch (error) {
+        console.error("Error fetching user setting:", error);
+        res.status(500).json({ message: "Error fetching user setting" });
+      }
+    });
+
+    app.post("/api/user/settings", isAuthenticated, async (req, res) => {
+      try {
+        if (!req.user?.id) {
+          return res.status(401).json({ message: "Unauthorized" });
+        }
+        const { key, value } = req.body;
+        if (!key) {
+          return res.status(400).json({ message: "Key is required" });
+        }
+
+        const updatedSetting = await storage.updateUserSetting(req.user.id, key, value);
+        res.json(updatedSetting);
+      } catch (error) {
+        console.error("Error updating user setting:", error);
+        res.status(500).json({ message: "Error updating user setting" });
+      }
+    });
+
+    // Admin: Manage Events
+    app.get("/api/admin/events", isAuthenticated, isVerified, async (req, res) => {
+      try {
+        const events = await storage.getEvents();
+        res.json(events);
+      } catch (error) {
+        logger.error("Admin events fetch failed");
+        res.status(500).json({ message: "Failed to fetch events" });
+      }
+    });
+
+    const httpServer = createServer(app);
+    return httpServer;
+  } catch (error) {
+    console.error('Error in registerRoutes:', error);
+    throw error;
+  }
 }

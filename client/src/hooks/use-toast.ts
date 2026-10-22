@@ -130,8 +130,17 @@ const listeners: Array<(state: State) => void> = []
 
 let memoryState: State = { toasts: [] }
 
+// Clear old toasts to prevent memory buildup
+const MAX_TOASTS = 5;
+const clearOldToasts = () => {
+  if (memoryState.toasts.length > MAX_TOASTS) {
+    memoryState.toasts = memoryState.toasts.slice(-MAX_TOASTS);
+  }
+};
+
 function dispatch(action: Action) {
   memoryState = reducer(memoryState, action)
+  clearOldToasts(); // Prevent toast memory buildup
   listeners.forEach((listener) => {
     listener(memoryState)
   })

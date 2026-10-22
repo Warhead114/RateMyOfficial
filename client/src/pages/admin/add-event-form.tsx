@@ -1,4 +1,4 @@
-import { useState } from "react";
+import React, { useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { InsertEvent, insertEventSchema, Official, InsertTeam, Team } from "@shared/schema";
@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/dialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { formatDateForStorage } from "@/lib/utils";
 
 const EVENT_TYPES = [
   "Dual Match",
@@ -52,21 +53,31 @@ export default function AddEventForm() {
   const { data: officialsResponse, isLoading: isLoadingOfficials } = useQuery<{data: Official[], total: number}>({
     queryKey: ["/api/officials"],
   });
-  const officials = officialsResponse?.data;
+  const officialsData = officialsResponse?.data;
+  const officials = officialsData ? [...officialsData].sort((a, b) => a.lastName.localeCompare(b.lastName)) : [];
 
-  // Fetch teams for selection
-  const { data: teams } = useQuery<Team[]>({
+  // Fetch all teams
+  const { data: teamsData, isLoading: teamsLoading } = useQuery<Team[]>({
     queryKey: ["/api/teams"],
+    queryFn: async () => {
+      const response = await apiRequest("GET", "/api/teams");
+      return response.json();
+    },
   });
+
+  // Sort teams alphabetically by name
+  const teams = teamsData ? [...teamsData].sort((a, b) => a.name.localeCompare(b.name)) : [];
+
 
   const form = useForm<InsertEvent>({
     resolver: zodResolver(insertEventSchema),
     defaultValues: {
       name: "",
       date: new Date().toISOString().split('T')[0], // Today's date as YYYY-MM-DD
+      startTime: "",
       venue: "",
       description: "",
-      eventType: "",
+      eventType: "Dual Match", // Set a default event type instead of empty string
       host: "",
       officials: [],
       teams: []
@@ -75,10 +86,20 @@ export default function AddEventForm() {
 
   const createTeamMutation = useMutation({
     mutationFn: async (data: InsertTeam) => {
-      return await apiRequest("POST", "/api/teams", data);
+      const response = await apiRequest("POST", "/api/teams", data);
+      return response.json();
     },
-    onSuccess: (newTeam: any) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/teams"] });
+    onSuccess: async (newTeam: any) => {
+      // Use multiple cache invalidation strategies to ensure the UI updates
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["/api/teams"] }),
+        queryClient.refetchQueries({ queryKey: ["/api/teams"] }),
+        queryClient.removeQueries({ queryKey: ["/api/teams"] }),
+      ]);
+
+      // Wait a moment for the queries to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       if (newTeam && newTeam.id) {
         setSelectedTeams(prev => [...prev, newTeam.id]);
       }
@@ -87,7 +108,7 @@ export default function AddEventForm() {
 
       toast({
         title: "Success!",
-        description: "Team has been created!",
+        description: "Team has been created and is now available for selection!",
       });
     },
     onError: (error) => {
@@ -103,17 +124,59 @@ export default function AddEventForm() {
     mutationFn: async (data: InsertEvent) => {
       setIsLoading(true);
       try {
-        await apiRequest("POST", "/api/events", {
+        // Format the date properly for storage to avoid timezone issues
+        const formattedData = {
           ...data,
+          date: typeof data.date === 'string' ? formatDateForStorage(data.date) : data.date,
           teams: selectedTeams
-        });
+        };
+        
+        console.log('Creating event with data:', formattedData);
+        const response = await apiRequest("POST", "/api/events", formattedData);
+        
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ message: 'Unknown error' }));
+          console.error('Event creation failed:', {
+            status: response.status,
+            statusText: response.statusText,
+            error: errorData
+          });
+          throw new Error(errorData.message || `Failed to create event (${response.status})`);
+        }
+        
+        const result = await response.json();
+        console.log('Event created successfully:', result);
         toast({
           title: "Success",
           description: "Event added successfully",
         });
         form.reset();
         setSelectedTeams([]);
-        queryClient.invalidateQueries({ queryKey: ["/api/events"] });
+
+        // Use multiple cache invalidation strategies to ensure all event-related UI updates
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["/api/events"] }),
+          queryClient.refetchQueries({ queryKey: ["/api/events"] }),
+          queryClient.removeQueries({ queryKey: ["/api/events"] }),
+        ]);
+
+        // Also invalidate any event-related queries that might be cached
+        queryClient.invalidateQueries({
+          predicate: (query) => {
+            const queryKey = query.queryKey;
+            return Array.isArray(queryKey) && queryKey.some(key => 
+              typeof key === 'string' && key.includes('events')
+            );
+          },
+        });
+
+        // Force immediate refetch of events to update EventList component
+        await queryClient.refetchQueries({ queryKey: ["/api/events"], type: 'active' });
+
+        // Wait a moment for the queries to complete
+        await new Promise(resolve => setTimeout(resolve, 300));
+
+        return result;
       } finally {
         setIsLoading(false);
       }
@@ -140,7 +203,7 @@ export default function AddEventForm() {
             <FormItem>
               <FormLabel>Event Name</FormLabel>
               <FormControl>
-                <Input {...field} />
+                <Input {...field} className="bg-transparent border-white/20 text-white" />
               </FormControl>
               <FormMessage />
             </FormItem>
@@ -154,7 +217,7 @@ export default function AddEventForm() {
             <FormItem>
               <FormLabel>Location</FormLabel>
               <FormControl>
-                <Input {...field} />
+                <Input {...field} className="bg-transparent border-white/20 text-white" />
               </FormControl>
               <FormMessage />
             </FormItem>
@@ -171,7 +234,26 @@ export default function AddEventForm() {
                 <Input 
                   type="date" 
                   {...field}
+                  className="bg-transparent border-white/20 text-white"
                   value={typeof field.value === 'string' ? field.value : field.value.toISOString().split('T')[0]}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="startTime"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Start Time (Optional)</FormLabel>
+              <FormControl>
+                <Input 
+                  type="time" 
+                  {...field}
+                  className="bg-transparent border-white/20 text-white"
                 />
               </FormControl>
               <FormMessage />
@@ -187,11 +269,11 @@ export default function AddEventForm() {
               <FormLabel>Event Type</FormLabel>
               <Select onValueChange={field.onChange} defaultValue={field.value}>
                 <FormControl>
-                  <SelectTrigger>
+                  <SelectTrigger className="bg-transparent border-white/20 text-white">
                     <SelectValue placeholder="Select event type" />
                   </SelectTrigger>
                 </FormControl>
-                <SelectContent className="max-h-[300px]">
+                <SelectContent className="max-h-[300px] bg-gray-800 text-white">
                   {EVENT_TYPES.map((type) => (
                     <SelectItem key={type} value={type}>{type}</SelectItem>
                   ))}
@@ -203,7 +285,7 @@ export default function AddEventForm() {
         />
 
         <div className="space-y-4">
-          <FormLabel>Teams</FormLabel>
+          <FormLabel className="text-white">Teams</FormLabel>
           <div className="flex gap-2">
             <Select
               onValueChange={(value) => {
@@ -213,20 +295,26 @@ export default function AddEventForm() {
                 setSelectedTeams(prev => [...prev, teamId]);
               }}
             >
-              <SelectTrigger className="flex-1">
+              <SelectTrigger className="flex-1 bg-transparent border-white/20 text-white">
                 <SelectValue placeholder="Select a team" />
               </SelectTrigger>
-              <SelectContent>
+              <SelectContent className="bg-gray-800 text-white">
                 <ScrollArea className="h-[200px]">
-                  {teams?.map((team) => (
-                    <SelectItem
-                      key={team.id}
-                      value={team.id.toString()}
-                      disabled={selectedTeams.includes(team.id)}
-                    >
-                      {team.name}
-                    </SelectItem>
-                  ))}
+                  {teamsLoading ? (
+                    <SelectItem value="loading" disabled>Loading teams...</SelectItem>
+                  ) : teams && teams.length > 0 ? (
+                    teams.map((team) => (
+                      <SelectItem
+                        key={team.id}
+                        value={team.id.toString()}
+                        disabled={selectedTeams.includes(team.id)}
+                      >
+                        {team.name}
+                      </SelectItem>
+                    ))
+                  ) : (
+                    <SelectItem value="no-teams" disabled>No teams available</SelectItem>
+                  )}
                 </ScrollArea>
               </SelectContent>
             </Select>
@@ -237,9 +325,9 @@ export default function AddEventForm() {
                   Add New Team
                 </Button>
               </DialogTrigger>
-              <DialogContent>
+              <DialogContent className="bg-gray-800 text-white">
                 <DialogHeader>
-                  <DialogTitle>Add New Team</DialogTitle>
+                  <DialogTitle className="text-white">Add New Team</DialogTitle>
                 </DialogHeader>
                 <div className="space-y-4 py-4">
                   <FormLabel htmlFor="newTeamName">Team Name</FormLabel>
@@ -248,6 +336,7 @@ export default function AddEventForm() {
                     value={newTeamName} 
                     onChange={(e) => setNewTeamName(e.target.value)} 
                     placeholder="Enter team name"
+                    className="bg-white border-gray-300 text-gray-900"
                   />
                 </div>
                 <DialogFooter>
@@ -264,15 +353,15 @@ export default function AddEventForm() {
           </div>
 
           {selectedTeams.length > 0 && (
-            <Card>
+            <Card className="bg-transparent border-white/20">
               <CardContent className="pt-6">
                 <div className="space-y-2">
-                  <h3 className="font-medium">Selected Teams:</h3>
+                  <h3 className="font-medium text-white">Selected Teams:</h3>
                   {selectedTeams.map((teamId) => {
                     const team = teams?.find(t => t.id === teamId);
                     return (
                       <div key={teamId} className="flex justify-between items-center">
-                        <span>{team?.name}</span>
+                        <span className="text-white">{team?.name}</span>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -292,16 +381,25 @@ export default function AddEventForm() {
           <FormField
             control={form.control}
             name="host"
-            render={({ field }) => (
-              <input 
-                type="hidden"
-                {...field}
-                value={selectedTeams.length > 0 ? 
-                  teams?.filter(t => selectedTeams.includes(t.id)).map(t => t.name).join(", ") : 
-                  "No host"
-                }
-              />
-            )}
+            render={({ field }) => {
+              // Auto-update host field when teams change
+              const hostValue = selectedTeams.length > 0 ? 
+                teams?.filter(t => selectedTeams.includes(t.id)).map(t => t.name).join(", ") || "Unknown Teams" : 
+                "No host";
+
+              // Update the field value whenever selectedTeams or teams change
+              React.useEffect(() => {
+                field.onChange(hostValue);
+              }, [hostValue, field.onChange]);
+
+              return (
+                <input 
+                  type="hidden"
+                  {...field}
+                  value={hostValue}
+                />
+              );
+            }}
           />
         </div>
 
@@ -319,10 +417,10 @@ export default function AddEventForm() {
                     field.onChange([...currentOfficials, { officialId }]);
                   }}
                 >
-                  <SelectTrigger>
+                  <SelectTrigger className="bg-transparent border-white/20 text-white">
                     <SelectValue placeholder="Select officials" />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="bg-gray-800 text-white">
                     {officials?.map((official) => (
                       <SelectItem 
                         key={official.id} 
@@ -341,7 +439,7 @@ export default function AddEventForm() {
                   );
                   return selectedOfficial ? (
                     <div key={index} className="flex items-center gap-2 mt-1">
-                      <span>
+                      <span className="text-white">
                         {selectedOfficial.firstName} {selectedOfficial.lastName}
                       </span>
                       <Button

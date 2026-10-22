@@ -5,8 +5,10 @@ import { Card, CardContent } from "@/components/ui/card";
 import { User } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
 import { queryClient } from "@/lib/queryClient";
+import { Loading } from "@/components/ui/loading";
+import { Loader2 } from "lucide-react";
 
-export function ProfileEdit({ user }: { user: User }) {
+function ProfileEdit({ user }: { user: User }) {
   const { toast } = useToast();
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -15,6 +17,12 @@ export function ProfileEdit({ user }: { user: User }) {
     setIsSubmitting(true);
 
     try {
+      // Show prominent loading message
+      toast({
+        title: "Updating Profile",
+        description: "Please wait while we save your changes...",
+      });
+
       const formData = new FormData();
       const form = e.currentTarget;
 
@@ -43,19 +51,23 @@ export function ProfileEdit({ user }: { user: User }) {
         throw new Error(updatedUser.message || "Failed to update profile");
       }
 
-      // Update the cache immediately with new data
+      // Force immediate cache update and refetch
       queryClient.setQueryData(["/api/auth/me"], updatedUser);
+      await queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/auth/me"], type: 'active' });
 
       toast({
         title: "Success",
         description: "Profile updated successfully",
       });
 
-      // Switch back to profile view
-      const profileTab = document.querySelector('[data-tab="profile"]') as HTMLButtonElement;
-      if (profileTab) {
-        profileTab.click();
-      }
+      // Switch back to profile view with slight delay to ensure cache update
+      setTimeout(() => {
+        const profileTab = document.querySelector('[data-tab="profile"]') as HTMLButtonElement;
+        if (profileTab) {
+          profileTab.click();
+        }
+      }, 500);
     } catch (error) {
       console.error('Profile update error:', error);
       toast({
@@ -150,8 +162,22 @@ export function ProfileEdit({ user }: { user: User }) {
         className="w-full"
         disabled={isSubmitting}
       >
-        {isSubmitting ? "Saving..." : "Save Changes"}
+        {isSubmitting ? (
+          <div className="flex items-center justify-center">
+            <div className="relative animate-pulse mr-2">
+              <div className="w-5 h-5 bg-white rounded-full flex items-center justify-center animate-ping">
+                <Loader2 className="w-3 h-3 animate-spin" />
+              </div>
+            </div>
+            Saving Changes...
+          </div>
+        ) : (
+          "Save Changes"
+        )}
       </Button>
     </form>
   );
 }
+
+export default ProfileEdit;
+export { ProfileEdit };

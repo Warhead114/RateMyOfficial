@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Loading } from "@/components/ui/loading";
 import { Loader2 } from "lucide-react";
 
 const EVENT_TYPES = [
@@ -46,23 +47,36 @@ export default function EventEdit() {
   const [isLoading, setIsLoading] = useState(true);
 
   // Fetch the event data
-  const { data: event, isLoading: isEventLoading } = useQuery<Event>({
+  const { data: event, isLoading: isEventLoading, error: eventError } = useQuery<Event>({
     queryKey: [`/api/events/${eventId}`],
     queryFn: async () => {
       const response = await apiRequest("GET", `/api/events/${eventId}`);
+      if (!response.ok) {
+        throw new Error('Failed to fetch event');
+      }
       return response.json();
     },
-    enabled: !isNaN(eventId)
+    enabled: !isNaN(eventId),
+    retry: 1
   });
 
   const { data: officialsResponse } = useQuery<{data: Official[], total: number}>({
     queryKey: ["/api/officials"],
   });
-  const officials = officialsResponse?.data;
+  const officialsData = officialsResponse?.data;
+  const officials = officialsData ? [...officialsData].sort((a, b) => a.lastName.localeCompare(b.lastName)) : [];
 
-  const { data: teams } = useQuery<Team[]>({
+  // Fetch all teams
+  const { data: teamsData } = useQuery<Team[]>({
     queryKey: ["/api/teams"],
+    queryFn: async () => {
+      const response = await apiRequest("GET", "/api/teams");
+      return response.json();
+    },
   });
+
+  // Sort teams alphabetically by name
+  const teams = teamsData ? [...teamsData].sort((a, b) => a.name.localeCompare(b.name)) : [];
 
   // Fetch event officials
   const { data: eventOfficials, isLoading: isEventOfficialsLoading } = useQuery<Official[]>({
@@ -101,18 +115,36 @@ export default function EventEdit() {
   // Update form with event data when it's loaded
   useEffect(() => {
     if (event) {
-      // Format date for the date input (YYYY-MM-DD) in Eastern Time
-      const date = new Date(event.date).toISOString().split('T')[0];
-      form.reset({
-        name: event.name,
-        date: date,
-        startTime: event.startTime || "",
-        venue: event.venue,
-        eventType: event.eventType,
-        host: event.host,
-        officials: [],
-        teams: []
-      });
+      try {
+        // Parse the date string directly without timezone conversion
+        // The database stores YYYY-MM-DD format dates, so extract it directly
+        let dateString: string;
+        const eventDate = event.date as Date | string;
+        if (typeof eventDate === 'string') {
+          // If it's already a string, extract YYYY-MM-DD
+          dateString = eventDate.split('T')[0];
+        } else {
+          // If it's a Date object, use UTC methods to avoid timezone shifts
+          const d = new Date(eventDate);
+          const year = d.getUTCFullYear();
+          const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+          const day = String(d.getUTCDate()).padStart(2, '0');
+          dateString = `${year}-${month}-${day}`;
+        }
+        
+        form.reset({
+          name: event.name || "",
+          date: dateString,
+          startTime: event.startTime || "",
+          venue: event.venue || "",
+          eventType: event.eventType || "Dual Match",
+          host: event.host || "",
+          officials: [],
+          teams: []
+        });
+      } catch (error) {
+        console.error('Error setting form data:', error);
+      }
     }
   }, [event, form]);
 
@@ -146,9 +178,8 @@ export default function EventEdit() {
         teams: selectedTeams
       };
 
-      // If the date is a string (from the date input), use the formatDateForStorage utility
-      // to ensure it's properly formatted for Eastern Time Zone
-      if (typeof formattedData.date === 'string') {
+      // Always ensure date is a string in YYYY-MM-DD format
+      if (formattedData.date) {
         formattedData.date = formatDateForStorage(formattedData.date);
       }
 
@@ -159,26 +190,39 @@ export default function EventEdit() {
       console.log('Event update API response:', result);
       return result;
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       console.log('Event update mutation successful with data:', data);
 
-      // Invalidate all affected queries
-      console.log('Invalidating queries for event update');
+      // Show immediate success feedback
+      toast({
+        title: "Updating Event",
+        description: "Please wait while we save your changes...",
+      });
 
-      // Use more aggressive query invalidation to ensure all data is refreshed
-      queryClient.invalidateQueries({
+      // Force aggressive cache invalidation and refetch
+      queryClient.removeQueries({
         predicate: (query) => {
-          // Invalidate any query related to events or the specific event
           const queryKey = Array.isArray(query.queryKey) ? query.queryKey[0] : query.queryKey;
           const stringKey = String(queryKey);
-          const shouldInvalidate = stringKey.includes('/api/events');
-
-          if (shouldInvalidate) {
-            console.log('Invalidating query with key:', queryKey);
-          }
-
-          return shouldInvalidate;
+          return stringKey.includes('/api/events');
         },
+      });
+
+      await queryClient.invalidateQueries({
+        predicate: (query) => {
+          const queryKey = Array.isArray(query.queryKey) ? query.queryKey[0] : query.queryKey;
+          const stringKey = String(queryKey);
+          return stringKey.includes('/api/events');
+        },
+      });
+
+      await queryClient.refetchQueries({
+        predicate: (query) => {
+          const queryKey = Array.isArray(query.queryKey) ? query.queryKey[0] : query.queryKey;
+          const stringKey = String(queryKey);
+          return stringKey.includes('/api/events');
+        },
+        type: 'active'
       });
 
       toast({
@@ -187,11 +231,11 @@ export default function EventEdit() {
         duration: 3000,
       });
 
-      // Wait slightly longer to ensure cache invalidation happens before navigation
+      // Navigate back with slight delay to ensure cache update
       setTimeout(() => {
-        console.log('Navigating back to events page');
-        setLocation("/events");
-      }, 1500);
+        console.log('Navigating back to admin dashboard');
+        setLocation("/admin?tab=manageEvents");
+      }, 500);
     },
     onError: (error) => {
       toast({
@@ -201,6 +245,15 @@ export default function EventEdit() {
       });
     },
   });
+
+  if (eventError) {
+    return (
+      <div className="flex flex-col items-center justify-center w-full h-64 space-y-4">
+        <p className="text-red-500">Error loading event: {eventError instanceof Error ? eventError.message : 'Unknown error'}</p>
+        <Button onClick={() => setLocation("/admin?tab=manageEvents")}>Back to Admin</Button>
+      </div>
+    );
+  }
 
   if (isLoading || !event) {
     return (
@@ -249,8 +302,8 @@ export default function EventEdit() {
                   <FormItem>
                     <FormLabel>Date</FormLabel>
                     <FormControl>
-                      <Input 
-                        type="date" 
+                      <Input
+                        type="date"
                         {...field}
                         value={typeof field.value === 'string' ? field.value : field.value ? new Date(field.value).toISOString().split('T')[0] : ''}
                       />
@@ -267,8 +320,8 @@ export default function EventEdit() {
                   <FormItem>
                     <FormLabel>Start Time</FormLabel>
                     <FormControl>
-                      <Input 
-                        type="time" 
+                      <Input
+                        type="time"
                         {...field}
                       />
                     </FormControl>
@@ -374,11 +427,11 @@ export default function EventEdit() {
                   control={form.control}
                   name="host"
                   render={({ field }) => (
-                    <input 
+                    <input
                       type="hidden"
                       {...field}
-                      value={selectedTeams.length > 0 ? 
-                        teams?.filter(t => selectedTeams.includes(t.id)).map(t => t.name).join(", ") : 
+                      value={selectedTeams.length > 0 ?
+                        teams?.filter(t => selectedTeams.includes(t.id)).map(t => t.name).join(", ") :
                         "No host"
                       }
                     />
@@ -445,12 +498,23 @@ export default function EventEdit() {
                   disabled={selectedOfficials.length === 0 || mutation.isPending}
                   className="flex-1"
                 >
-                  {mutation.isPending ? "Updating..." : "Update Event"}
+                  {mutation.isPending ? (
+                    <div className="flex items-center justify-center">
+                      <div className="relative animate-pulse mr-2">
+                        <div className="w-5 h-5 bg-white rounded-full flex items-center justify-center animate-ping">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        </div>
+                      </div>
+                      Updating Event...
+                    </div>
+                  ) : (
+                    "Update Event"
+                  )}
                 </Button>
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() => setLocation("/events")}
+                  onClick={() => setLocation("/admin?tab=manageEvents")}
                   className="flex-1"
                 >
                   Cancel

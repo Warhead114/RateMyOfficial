@@ -53,8 +53,10 @@ export default function AdminLogin() {
         // Wait for query invalidation before redirecting
         await queryClient.refetchQueries({ queryKey: ["/api/auth/me"] });
         
-        // Use direct page navigation instead of React Router to ensure a complete refresh
-        window.location.href = "/admin";
+        // Small delay to ensure session is properly established
+        setTimeout(() => {
+          window.location.href = "/admin";
+        }, 100);
       } finally {
         setIsLoading(false);
       }
@@ -87,7 +89,7 @@ export default function AdminLogin() {
                 name="email"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Email</FormLabel>
+                    <FormLabel className="text-foreground font-medium">Email</FormLabel>
                     <FormControl>
                       <Input type="email" {...field} />
                     </FormControl>
@@ -101,7 +103,7 @@ export default function AdminLogin() {
                 name="password"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Password</FormLabel>
+                    <FormLabel className="text-foreground font-medium">Password</FormLabel>
                     <FormControl>
                       <Input type="password" {...field} />
                     </FormControl>
@@ -112,10 +114,10 @@ export default function AdminLogin() {
 
               <Button
                 type="submit"
-                className="w-full"
+                className="w-full text-black font-bold hover:text-black"
                 disabled={isLoading}
               >
-                {isLoading ? "Logging in..." : "Login"}
+                Login
               </Button>
             </form>
           </Form>

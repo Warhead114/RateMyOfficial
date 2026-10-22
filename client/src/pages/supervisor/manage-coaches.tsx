@@ -5,15 +5,9 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { refreshUtils } from "@/lib/refreshUtils";
 
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import {
   Card,
   CardContent,
@@ -59,6 +53,7 @@ const coachEditSchema = z.object({
   email: z.string().email("Invalid email address"),
   school: z.string().optional(),
   yearsCoaching: z.coerce.number().int().nonnegative().optional(),
+  region: z.string().optional(),
 });
 
 type CoachEditValues = z.infer<typeof coachEditSchema>;
@@ -70,7 +65,7 @@ export default function ManageCoaches() {
 
   // Get all coaches (same as admin for feature parity)
   const { data: coaches, isLoading } = useQuery({
-    queryKey: ["/api/admin/coaches"],
+    queryKey: ["/api/supervisor/coaches"],
     queryFn: getQueryFn({ on401: "throw" }),
   });
 
@@ -83,25 +78,49 @@ export default function ManageCoaches() {
       email: "",
       school: "",
       yearsCoaching: 0,
+      region: "",
     },
   });
 
   // Delete coach mutation
   const deleteCoachMutation = useMutation({
     mutationFn: async (coachId: number) => {
-      await apiRequest("DELETE", `/api/admin/coaches/${coachId}`);
+      const response = await apiRequest("DELETE", `/api/supervisor/coaches/${coachId}`);
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ message: "Failed to delete coach" }));
+        throw new Error(error.message || "Failed to delete coach");
+      }
+      return response.json();
     },
-    onSuccess: () => {
-      toast({
-        title: "Coach deleted",
-        description: "The coach has been successfully deleted",
-      });
-      queryClient.invalidateQueries({ queryKey: ["/api/admin/coaches"] });
+    onSuccess: async () => {
+      console.log('Coach delete successful, refreshing caches');
+      
+      try {
+        // Use standardized refresh utility for coach deletion
+        await refreshUtils.coaches.afterDelete();
+        
+        toast({
+          title: "Coach deleted",
+          description: "The coach has been successfully deleted",
+        });
+      } catch (error) {
+        console.error('RefreshUtils error in supervisor manage-coaches delete:', error);
+        // Fallback to manual refresh if utility fails
+        queryClient.removeQueries({ queryKey: ["/api/supervisor/coaches"] });
+        await queryClient.invalidateQueries({ queryKey: ["/api/supervisor/coaches"] });
+        await queryClient.refetchQueries({ queryKey: ["/api/supervisor/coaches"], type: 'active' });
+        
+        toast({
+          title: "Coach deleted",
+          description: "The coach has been successfully deleted",
+        });
+      }
     },
-    onError: (error) => {
+    onError: (error: any) => {
+      console.error("Delete coach error:", error);
       toast({
         title: "Error",
-        description: "Failed to delete coach",
+        description: error.message || "Failed to delete coach",
         variant: "destructive",
       });
     },
@@ -110,20 +129,44 @@ export default function ManageCoaches() {
   // Edit coach mutation
   const editCoachMutation = useMutation({
     mutationFn: async ({ id, data }: { id: number; data: CoachEditValues }) => {
-      await apiRequest("PATCH", `/api/admin/coaches/${id}`, data);
+      const response = await apiRequest("PATCH", `/api/supervisor/coaches/${id}`, data);
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ message: "Failed to update coach" }));
+        throw new Error(error.message || "Failed to update coach");
+      }
+      return response.json();
     },
-    onSuccess: () => {
-      toast({
-        title: "Coach updated",
-        description: "The coach profile has been successfully updated",
-      });
-      setEditDialogOpen(false);
-      queryClient.invalidateQueries({ queryKey: ["/api/admin/coaches"] });
+    onSuccess: async () => {
+      console.log('Coach edit successful, refreshing caches');
+      
+      try {
+        // Use standardized refresh utility for coach edit
+        await refreshUtils.coaches.afterEdit(selectedCoach?.id.toString() || '');
+        
+        toast({
+          title: "Coach updated",
+          description: "The coach profile has been successfully updated",
+        });
+        setEditDialogOpen(false);
+      } catch (error) {
+        console.error('RefreshUtils error in supervisor manage-coaches edit:', error);
+        // Fallback to manual refresh if utility fails
+        queryClient.removeQueries({ queryKey: ["/api/supervisor/coaches"] });
+        await queryClient.invalidateQueries({ queryKey: ["/api/supervisor/coaches"] });
+        await queryClient.refetchQueries({ queryKey: ["/api/supervisor/coaches"], type: 'active' });
+        
+        toast({
+          title: "Coach updated",
+          description: "The coach profile has been successfully updated",
+        });
+        setEditDialogOpen(false);
+      }
     },
-    onError: (error) => {
+    onError: (error: any) => {
+      console.error("Edit coach error:", error);
       toast({
         title: "Error",
-        description: "Failed to update coach",
+        description: error.message || "Failed to update coach",
         variant: "destructive",
       });
     },
@@ -154,65 +197,100 @@ export default function ManageCoaches() {
   };
 
   return (
-    <Card>
+    <Card className="bg-transparent border-white/20">
       <CardHeader>
-        <CardTitle>Manage Coaches</CardTitle>
-        <CardDescription>
+        <CardTitle className="text-white">Manage Coaches</CardTitle>
+        <CardDescription className="text-white/70">
           View, edit, and delete coaches in the system
         </CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading ? (
-          <div className="flex justify-center items-center p-8">
-            <Loader2 className="h-8 w-8 animate-spin" />
+          <div className="flex flex-col items-center justify-center py-16 space-y-4">
+            <div className="relative animate-pulse">
+              <div className="w-20 h-20 bg-white rounded-full flex items-center justify-center">
+                <img
+                  src="/uploads/wrestlers-silhouette.png"
+                  alt="Loading..."
+                  className="w-12 h-12 opacity-70"
+                />
+              </div>
+            </div>
+            <p className="text-white font-semibold text-shadow-md">Loading coaches...</p>
           </div>
         ) : coaches && coaches.length > 0 ? (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Email</TableHead>
-                <TableHead>School</TableHead>
-                <TableHead>Years Coaching</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {coaches.map((coach: Coach) => (
-                <TableRow key={coach.id}>
-                  <TableCell className="font-medium">
-                    {coach.firstName} {coach.lastName}
-                  </TableCell>
-                  <TableCell>{coach.email}</TableCell>
-                  <TableCell>{coach.school || "—"}</TableCell>
-                  <TableCell>{coach.yearsCoaching || "—"}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex justify-end gap-2">
-                      <Button 
-                        variant="outline" 
-                        size="icon"
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {coaches.map((coach: Coach) => (
+              <Card key={coach.id} className="bg-transparent border-white/30 shadow-xl">
+                <CardContent className="pt-6">
+                  <div className="flex justify-between items-start">
+                    <div className="space-y-2">
+                      <h3 className="font-semibold text-white text-shadow-lg">
+                        {coach.firstName} {coach.lastName}
+                      </h3>
+                      <div className="text-sm text-white font-medium text-shadow-md space-y-1">
+                        <p><span className="font-semibold">Email:</span> {coach.email}</p>
+                        <p><span className="font-semibold">School:</span> {coach.school || 'Not specified'}</p>
+                        <p><span className="font-semibold">Years Coaching:</span> {coach.yearsCoaching || 'Not specified'}</p>
+                        <p><span className="font-semibold">Region:</span> {coach.region || 'Not specified'}</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="bg-black/80 backdrop-blur-md border-white/30 text-white hover:bg-black/90 hover:text-white shadow-lg"
                         onClick={() => handleEditCoach(coach)}
-                        disabled={deleteCoachMutation.isPending}
+                        disabled={deleteCoachMutation.isPending || editCoachMutation.isPending}
                       >
-                        <Pencil className="h-4 w-4" />
+                        {editCoachMutation.isPending ? (
+                          <div className="flex items-center justify-center">
+                            <div className="relative mr-2">
+                              <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                              <img
+                                src="/uploads/wrestlers-silhouette.png"
+                                alt=""
+                                className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                              />
+                            </div>
+                            Updating...
+                          </div>
+                        ) : (
+                          "Edit"
+                        )}
                       </Button>
-                      <Button 
-                        variant="destructive" 
-                        size="icon"
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        className="bg-red-600/80 backdrop-blur-md border-red-500/50 text-white hover:bg-red-700/90 hover:text-white shadow-lg"
                         onClick={() => handleDeleteCoach(coach)}
-                        disabled={deleteCoachMutation.isPending}
+                        disabled={deleteCoachMutation.isPending || editCoachMutation.isPending}
                       >
-                        <Trash2 className="h-4 w-4" />
+                        {deleteCoachMutation.isPending ? (
+                          <div className="flex items-center justify-center">
+                            <div className="relative mr-2">
+                              <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                              <img
+                                src="/uploads/wrestlers-silhouette.png"
+                                alt=""
+                                className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                              />
+                            </div>
+                            Deleting...
+                          </div>
+                        ) : (
+                          "Delete"
+                        )}
                       </Button>
                     </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
         ) : (
           <div className="text-center p-4">
-            <p className="text-muted-foreground">No coaches found in the system.</p>
+            <p className="text-white font-semibold text-shadow-md">No coaches found in the system.</p>
           </div>
         )}
 
@@ -240,7 +318,7 @@ export default function ManageCoaches() {
                     </FormItem>
                   )}
                 />
-                
+
                 <FormField
                   control={form.control}
                   name="lastName"
@@ -254,7 +332,7 @@ export default function ManageCoaches() {
                     </FormItem>
                   )}
                 />
-                
+
                 <FormField
                   control={form.control}
                   name="email"
@@ -268,7 +346,7 @@ export default function ManageCoaches() {
                     </FormItem>
                   )}
                 />
-                
+
                 <FormField
                   control={form.control}
                   name="school"
@@ -282,7 +360,7 @@ export default function ManageCoaches() {
                     </FormItem>
                   )}
                 />
-                
+
                 <FormField
                   control={form.control}
                   name="yearsCoaching"
@@ -296,25 +374,46 @@ export default function ManageCoaches() {
                     </FormItem>
                   )}
                 />
-                
+
+                <FormField
+                  control={form.control}
+                  name="region"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Region</FormLabel>
+                      <FormControl>
+                        <Input {...field} placeholder="e.g., West Region" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
                 <DialogFooter>
-                  <Button 
-                    type="button" 
-                    variant="outline" 
+                  <Button
+                    type="button"
+                    variant="outline"
                     onClick={() => setEditDialogOpen(false)}
                     disabled={editCoachMutation.isPending}
                   >
                     Cancel
                   </Button>
-                  <Button 
-                    type="submit" 
+                  <Button
+                    type="submit"
                     disabled={editCoachMutation.isPending}
                   >
                     {editCoachMutation.isPending ? (
-                      <>
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      <div className="flex items-center justify-center">
+                        <div className="relative mr-2">
+                          <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                          <img
+                            src="/uploads/wrestlers-silhouette.png"
+                            alt=""
+                            className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                          />
+                        </div>
                         Saving...
-                      </>
+                      </div>
                     ) : (
                       "Save Changes"
                     )}
@@ -331,19 +430,19 @@ export default function ManageCoaches() {
 
 function getQueryFn({ on401 }: { on401: "throw" | "returnNull" }) {
   return async () => {
-    const response = await fetch("/api/admin/coaches");
-    
+    const response = await apiRequest("GET", "/api/supervisor/coaches");
+
     if (response.status === 401) {
       if (on401 === "throw") {
         throw new Error("Unauthorized");
       }
       return null;
     }
-    
+
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
-    
+
     return response.json();
   };
 }

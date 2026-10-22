@@ -11,7 +11,7 @@ export function isVerified(req: Request, res: Response, next: NextFunction) {
   if (req.isAuthenticated() && req.user?.isVerified) {
     return next();
   }
-  res.status(403).json({ message: "Email verification required" });
+  res.status(403).json({ message: "Account approval required" });
 }
 
 export function isAdmin(req: Request, res: Response, next: NextFunction) {

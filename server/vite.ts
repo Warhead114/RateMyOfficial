@@ -8,6 +8,7 @@ const __dirname = dirname(__filename);
 import { type Server } from "http";
 import viteConfig from "../vite.config";
 import { nanoid } from "nanoid";
+import { blockSourceArchives } from "./http-middleware";
 
 const viteLogger = createLogger();
 
@@ -26,23 +27,34 @@ export async function setupVite(app: Express, server: Server) {
   const serverOptions = {
     middlewareMode: true,
     hmr: { server },
-    allowedHosts: true,
+    allowedHosts: true as const,
+    fs: {
+      deny: [
+        ".env",
+        ".env.*",
+        "*.{crt,pem}",
+        "**/.git/**",
+        "**/app-code.zip",
+        "**/app-source-code.zip",
+        "**/RateMyOfficial-source-updated-2026-08-30.zip",
+        "**/RateMyOfficial-source-updated-2026-08-30.zip.part-00",
+        "**/RateMyOfficial-source-updated-2026-08-30.zip.part-01",
+        "**/RateMyOfficial-source-updated-2026-08-30.zip.part-02",
+        "**/RateMyOfficial-source*.zip*",
+        "**/node_modules-part-*.zip",
+      ],
+    },
   };
 
   const vite = await createViteServer({
     ...viteConfig,
     configFile: false,
-    customLogger: {
-      ...viteLogger,
-      error: (msg, options) => {
-        viteLogger.error(msg, options);
-        process.exit(1);
-      },
-    },
+    customLogger: viteLogger,
     server: serverOptions,
     appType: "custom",
   });
 
+  app.use(blockSourceArchives);
   app.use(vite.middlewares);
   app.use("*", async (req, res, next) => {
     const url = req.originalUrl;
@@ -79,10 +91,13 @@ export function serveStatic(app: Express) {
     );
   }
 
+  app.use(blockSourceArchives);
   app.use(express.static(distPath));
 
   // fall through to index.html if the file doesn't exist
-  app.use("*", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+  app.use("*", (_req, res, next) => {
+    res.sendFile(path.resolve(distPath, "index.html"), (error) => {
+      if (error) next(error);
+    });
   });
 }
