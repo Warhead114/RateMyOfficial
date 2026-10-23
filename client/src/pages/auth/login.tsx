@@ -49,17 +49,34 @@ export default function Login() {
 
         // Wait for query invalidation before redirecting
         await queryClient.refetchQueries({ queryKey: ["/api/auth/me"] });
-        
-        // Based on user type, redirect to the appropriate dashboard
-        if (userData.role === 'admin') {
-          window.location.href = "/admin";
-        } else if (userData.userType === 'Regional Supervisor') {
-          window.location.href = "/supervisor";
-        } else if (userData.userType === 'Coach') {
-          window.location.href = "/coach";
-        } else {
-          window.location.href = "/";
-        }
+
+        // Get fresh user data to ensure accurate redirect
+        const freshUserResponse = await apiRequest("GET", "/api/auth/me");
+        const freshUserData = await freshUserResponse.json();
+
+        // Small delay to ensure session is properly established
+        setTimeout(() => {
+          // Based on user type, redirect to the appropriate dashboard
+          // Check both original and fresh user data for reliability
+          const userRole = userData.role || freshUserData.role;
+          const userType = userData.userType || freshUserData.userType;
+          
+          console.log('Redirect logic - Role:', userRole, 'Type:', userType);
+          
+          if (userRole === 'admin') {
+            console.log('Redirecting admin to /admin');
+            window.location.href = "/admin";
+          } else if (userType === 'Regional Supervisor') {
+            console.log('Redirecting supervisor to /supervisor');
+            window.location.href = "/supervisor";
+          } else if (userType === 'Coach') {
+            console.log('Redirecting coach to /coach');
+            window.location.href = "/coach";
+          } else {
+            console.log('Redirecting to home page');
+            window.location.href = "/";
+          }
+        }, 100);
       } finally {
         setIsLoading(false);
       }
@@ -90,9 +107,9 @@ export default function Login() {
                 name="email"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Email</FormLabel>
+                    <FormLabel className="text-foreground font-medium">Email</FormLabel>
                     <FormControl>
-                      <Input type="email" {...field} />
+                      <Input type="email" autoComplete="username" {...field} />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -104,27 +121,33 @@ export default function Login() {
                 name="password"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Password</FormLabel>
+                    <FormLabel className="text-foreground font-medium">Password</FormLabel>
                     <FormControl>
-                      <Input type="password" {...field} />
+                      <Input type="password" autoComplete="current-password" {...field} />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )}
               />
 
+              <p className="text-sm text-right">
+                <Link href="/forgot-password" className="text-primary hover:underline">
+                  Forgot Password?
+                </Link>
+              </p>
+
               <Button
                 type="submit"
-                className="w-full"
+                className="w-full text-black font-bold hover:text-black"
                 disabled={isLoading}
               >
-                {isLoading ? "Logging in..." : "Login"}
+                Login
               </Button>
 
               <p className="text-sm text-center text-muted-foreground">
                 Don't have an account?{" "}
-                <Link href="/register">
-                  <a className="text-primary hover:underline">Register</a>
+                <Link href="/register" className="text-primary hover:underline">
+                  Register
                 </Link>
               </p>
             </form>

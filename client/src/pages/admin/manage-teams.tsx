@@ -34,14 +34,17 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
-import { AlertCircle, Loader2, Pencil, Trash } from "lucide-react";
+import { AlertCircle, Pencil, Trash } from "lucide-react";
+import { Loading } from "@/components/ui/loading";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { AdminRegionEditor } from "@/components/admin-region-editor";
 
 interface Team {
   id: number;
   name: string;
   createdAt: string;
+  region?: string | null;
 }
 
 const teamFormSchema = z.object({
@@ -67,13 +70,28 @@ export default function ManageTeams() {
   });
 
   // Query to get all teams
-  const { data: teams = [], isLoading, error } = useQuery({
+  const { data: teamsData = [], isLoading, error } = useQuery({
     queryKey: ["/api/teams"],
     queryFn: async () => {
       const response = await apiRequest("GET", "/api/teams");
       return response.json();
     },
   });
+  const { data: authUser } = useQuery<{ role?: string; user?: { role?: string } }>({
+    queryKey: ["/api/auth/me"],
+  });
+  const { data: officialsData } = useQuery<{
+    data?: Array<{ association?: string | null }>;
+  }>({
+    queryKey: ["/api/officials"],
+  });
+  const isAdmin = authUser?.role === "admin" || authUser?.user?.role === "admin";
+  const regionSuggestions = Array.from(
+    new Set((officialsData?.data ?? []).map((official) => official.association?.trim()).filter(Boolean)),
+  ) as string[];
+
+  // Sort teams alphabetically by name
+  const teams = [...teamsData].sort((a, b) => a.name.localeCompare(b.name));
 
   // Mutation to create a new team
   const createTeamMutation = useMutation({
@@ -105,8 +123,7 @@ export default function ManageTeams() {
       const response = await apiRequest("PATCH", `/api/teams/${id}`, data);
       return response.json();
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/teams"] });
+    onSuccess: async () => {
       toast({
         title: "Success",
         description: "Team updated successfully",
@@ -114,6 +131,11 @@ export default function ManageTeams() {
       setEditDialogOpen(false);
       setCurrentTeam(null);
       form.reset();
+
+      // Force immediate cache invalidation and refetch
+      queryClient.removeQueries({ queryKey: ["/api/teams"] });
+      await queryClient.invalidateQueries({ queryKey: ["/api/teams"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/teams"], type: 'active' });
     },
     onError: (error: any) => {
       toast({
@@ -126,30 +148,31 @@ export default function ManageTeams() {
 
   // Mutation to delete a team
   const deleteTeamMutation = useMutation({
-    mutationFn: async (id: number) => {
-      const response = await apiRequest("DELETE", `/api/teams/${id}`);
+    mutationFn: async (teamId: number) => {
+      const response = await apiRequest("DELETE", `/api/teams/${teamId}`);
       if (!response.ok) {
-        const error = await response.json();
+        const error = await response.json().catch(() => ({ message: "Failed to delete team" }));
         throw new Error(error.message || "Failed to delete team");
       }
       return response.json();
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/teams"] });
+    onSuccess: async () => {
       toast({
-        title: "Success",
-        description: "Team deleted successfully",
+        title: "Team deleted",
+        description: "The team has been successfully deleted",
       });
       setDeleteConfirmOpen(false);
       setCurrentTeam(null);
+      await queryClient.invalidateQueries({ queryKey: ["/api/teams"] });
+      await queryClient.refetchQueries({ queryKey: ["/api/teams"] });
     },
     onError: (error: any) => {
+      console.error("Delete team error:", error);
       toast({
         title: "Error",
         description: error.message || "Failed to delete team",
         variant: "destructive",
       });
-      setDeleteConfirmOpen(false);
     },
   });
 
@@ -190,9 +213,8 @@ export default function ManageTeams() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center w-full h-64">
-        <Loader2 className="w-6 h-6 animate-spin" />
-        <span className="ml-2">Loading teams...</span>
+      <div className="w-full h-64 flex items-center justify-center">
+        <Loading text="Loading teams..." />
       </div>
     );
   }
@@ -210,11 +232,11 @@ export default function ManageTeams() {
   }
 
   return (
-    <Card>
+    <Card className="bg-transparent border-white/20">
       <CardHeader className="flex flex-row items-center justify-between">
         <div>
-          <CardTitle>Manage Teams</CardTitle>
-          <CardDescription>
+          <CardTitle className="text-white">Manage Teams</CardTitle>
+          <CardDescription className="text-white/70">
             View, edit, and delete teams in the system
           </CardDescription>
         </div>
@@ -251,16 +273,52 @@ export default function ManageTeams() {
                     <Button
                       variant="outline"
                       size="sm"
+                      className="bg-black/80 backdrop-blur-md border-white/30 text-white hover:bg-black/90 hover:text-white shadow-lg"
                       onClick={() => handleEditTeam(team)}
+                      disabled={updateTeamMutation.isPending || deleteTeamMutation.isPending}
                     >
-                      <Pencil className="h-4 w-4 mr-1" /> Edit
+                      {updateTeamMutation.isPending && currentTeam?.id === team.id ? (
+                        <div className="flex items-center justify-center">
+                          <div className="relative mr-1">
+                            <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                            <img 
+                              src="/uploads/wrestlers-silhouette.png" 
+                              alt="" 
+                              className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                            />
+                          </div>
+                          Updating...
+                        </div>
+                      ) : (
+                        <>
+                          <Pencil className="h-4 w-4 mr-1" /> Edit
+                        </>
+                      )}
                     </Button>
                     <Button
                       variant="destructive"
                       size="sm"
+                      className="bg-red-600/80 backdrop-blur-md border-red-500/50 text-white hover:bg-red-700/90 hover:text-white shadow-lg"
                       onClick={() => handleDeleteTeam(team)}
+                      disabled={updateTeamMutation.isPending || deleteTeamMutation.isPending}
                     >
-                      <Trash className="h-4 w-4 mr-1" /> Delete
+                      {deleteTeamMutation.isPending && currentTeam?.id === team.id ? (
+                        <div className="flex items-center justify-center">
+                          <div className="relative mr-1">
+                            <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                            <img 
+                              src="/uploads/wrestlers-silhouette.png" 
+                              alt="" 
+                              className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                            />
+                          </div>
+                          Deleting...
+                        </div>
+                      ) : (
+                        <>
+                          <Trash className="h-4 w-4 mr-1" /> Delete
+                        </>
+                      )}
                     </Button>
                   </TableCell>
                 </TableRow>
@@ -287,7 +345,7 @@ export default function ManageTeams() {
                     <FormItem>
                       <FormLabel>Team Name</FormLabel>
                       <FormControl>
-                        <Input placeholder="Enter team name" {...field} />
+                        <Input placeholder="Enter team name" {...field} className="bg-transparent border-white/20 text-white"/>
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -299,18 +357,45 @@ export default function ManageTeams() {
                       Cancel
                     </Button>
                   </DialogClose>
-                  <Button 
-                    type="submit" 
+                  <Button
+                    type="submit"
                     disabled={updateTeamMutation.isPending}
                   >
-                    {updateTeamMutation.isPending && (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    {updateTeamMutation.isPending ? (
+                      <div className="flex items-center justify-center">
+                        <div className="relative mr-2">
+                          <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                          <img 
+                            src="/uploads/wrestlers-silhouette.png" 
+                            alt="" 
+                            className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                          />
+                        </div>
+                        Saving...
+                      </div>
+                    ) : (
+                      "Save Changes"
                     )}
-                    Save Changes
                   </Button>
                 </DialogFooter>
               </form>
             </Form>
+            {currentTeam && (
+              <AdminRegionEditor
+                key={`team-region-${currentTeam.id}`}
+                isAdmin={isAdmin}
+                recordId={currentTeam.id}
+                region={currentTeam.region}
+                endpoint={`/api/admin/teams/${currentTeam.id}/region`}
+                suggestions={regionSuggestions}
+                queryKeys={[
+                  ["/api/teams"],
+                  ["/api/admin/coaches"],
+                  ["/api/supervisor/coaches"],
+                ]}
+                helpText="A region change alone does not approve event notifications. If a coach’s notification eligibility needs review, verify their team and email, then explicitly save the managed profile to reapprove."
+              />
+            )}
           </DialogContent>
         </Dialog>
 
@@ -332,7 +417,7 @@ export default function ManageTeams() {
                     <FormItem>
                       <FormLabel>Team Name</FormLabel>
                       <FormControl>
-                        <Input placeholder="Enter team name" {...field} />
+                        <Input placeholder="Enter team name" {...field} className="bg-white border-gray-300 text-gray-900"/>
                       </FormControl>
                       <FormMessage />
                     </FormItem>
@@ -344,14 +429,25 @@ export default function ManageTeams() {
                       Cancel
                     </Button>
                   </DialogClose>
-                  <Button 
-                    type="submit" 
+                  <Button
+                    type="submit"
                     disabled={createTeamMutation.isPending}
                   >
-                    {createTeamMutation.isPending && (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    {createTeamMutation.isPending ? (
+                      <div className="flex items-center justify-center">
+                        <div className="relative mr-2">
+                          <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                          <img 
+                            src="/uploads/wrestlers-silhouette.png" 
+                            alt="" 
+                            className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                          />
+                        </div>
+                        Adding...
+                      </div>
+                    ) : (
+                      "Add Team"
                     )}
-                    Add Team
                   </Button>
                 </DialogFooter>
               </form>
@@ -377,10 +473,21 @@ export default function ManageTeams() {
                 onClick={() => currentTeam && deleteTeamMutation.mutate(currentTeam.id)}
                 disabled={deleteTeamMutation.isPending}
               >
-                {deleteTeamMutation.isPending && (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                {deleteTeamMutation.isPending ? (
+                  <div className="flex items-center justify-center">
+                    <div className="relative mr-2">
+                      <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                      <img 
+                        src="/uploads/wrestlers-silhouette.png" 
+                        alt="" 
+                        className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                      />
+                    </div>
+                    Deleting...
+                  </div>
+                ) : (
+                  "Delete"
                 )}
-                Delete
               </Button>
             </DialogFooter>
           </DialogContent>

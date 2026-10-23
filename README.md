@@ -1,50 +1,45 @@
-🏅 Wrestling Official Review App
-Overview
-The Wrestling Official Review App is a web-based platform designed to help coaches and regional supervisors rate and review wrestling officials based on their performance at specific events. Built with user-friendliness and integrity in mind, the app aims to support accountability, consistency, and development within the wrestling officiating community.
+# RateMyOfficial
 
-🎯 Purpose
-This application serves as a valuable tool for:
+Full-stack application for official profiles, event assignments, evaluations,
+coach/regional administration and transactional email.
 
-Coaches who want to provide feedback on officials' performance.
+## Local development
 
-Regional supervisors seeking data-driven insights to improve official training and assignments.
+Use Node.js 22 and npm. Install locked dependencies with `npm ci`. Configure a
+dedicated Development PostgreSQL database and environment through your trusted
+runtime; `.env.example` lists required/optional variable names without values.
+The application reads process environment variables, not this template file.
+Never copy Production database connections or Production secrets into Development.
+`replit.public.toml` is a sanitized Replit configuration template, not an active
+workspace configuration. Validate/apply it through Replit's supported tools;
+private originating-workspace identifiers are not part of the public source.
 
-By standardizing the review process and enabling verified, event-specific feedback, the platform promotes fairness and performance tracking across the sport.
+- `npm run dev` starts the Development application.
+- `npm run check` checks TypeScript.
+- `npm run build` produces the web/server and scoped validation CLI bundles.
+- `npm test` runs automated tests; database integration commands require a
+  separately proven, isolated Development test database.
 
-🔍 Key Features
-Event-Based Reviews
-Users can select from a list of wrestling events to review officials who worked those specific matches.
+Do not run tests, diagnostics or SQL against Production as a setup shortcut.
+SQL under `migrations/` is source documentation/prepared changes, not permission
+to apply it. Follow the target environment's authorized migration procedure.
 
-Structured Rating System
-Officials are rated on the following criteria (1–5 scale):
+## Public snapshot boundary
 
-Positioning
+This branch is a sanitized current-source snapshot based on the existing GitHub
+main history. It does not import private Replit commit ancestry. See
+[snapshot notes](docs/public-source-snapshot.md) for exclusions and intentional
+differences. Runtime user data and personal photos are not bundled; only reviewed
+interface/background assets are included.
 
-Mechanics
+## Email safety
 
-Stalling
+Delivery defaults to off. The manual GitHub validation workflow is included as
+source but intentionally rejects public repositories and remains unsuitable for
+execution in this public destination without a separately approved runner design.
+Do not enable secrets, change that guard or trigger jobs as part of synchronization.
 
-Consistency
-
-One Review Per Official Per Event
-To maintain fairness, each reviewer is limited to a single review per official per event.
-
-Leaderboard System
-A ranking feature highlights top-performing officials based on average review scores.
-
-Official Verification
-Officials are verified to ensure the authenticity of reviews and prevent duplicates or impersonation.
-
-🛠️ Tech Stack
-The specific technologies used will be added here once development is underway.
-(Example: React, Node.js, PostgreSQL, Tailwind CSS, etc.)
-
-🚧 Development Status
-This app is currently under development. Core functionality is being built out first, with official and event data to be populated once the wrestling season begins in November 2025.
-
-📌 Goals
-Improve transparency and consistency in officiating.
-
-Provide officials with actionable feedback to support growth.
-
-Help organizers make informed decisions based on real data.
+See [the protected runner procedure](docs/email-github-actions.md) and
+[scoped validation contracts](docs/email-scoped-validation.md). Live delivery,
+workers, scheduling, Production fixtures and cleanup all require their appropriate
+separate authorizations. Publishing this source is not email-execution approval.

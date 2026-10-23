@@ -50,7 +50,7 @@ export default function SearchBar() {
                     setQuery("");
                   }}
                 >
-                  <div className="font-medium">{official.name}</div>
+                  <div className="font-medium">{official.firstName} {official.lastName}</div>
                   <div className="text-sm text-muted-foreground">
                     {official.location}
                   </div>

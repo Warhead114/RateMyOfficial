@@ -1,84 +1,142 @@
-import { useState, useEffect } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { apiRequest } from "@/lib/queryClient";
 
-export default function CoachSettings() {
-  const [theme, setTheme] = useState<string>("light");
+function CoachSettings() {
   const { toast } = useToast();
-
-  // Fetch current user settings
-  const { data: userSettings, isLoading } = useQuery<Array<{ key: string; value: string }>>({
-    queryKey: ["/api/user/settings"],
-    retry: false,
+  const [isChangingPassword, setIsChangingPassword] = useState(false);
+  const [passwordForm, setPasswordForm] = useState({
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: "",
   });
 
-  useEffect(() => {
-    // Find the theme setting if it exists
-    if (userSettings && Array.isArray(userSettings)) {
-      const themeSetting = userSettings.find((setting) => setting.key === "theme");
-      if (themeSetting) {
-        setTheme(themeSetting.value);
-      }
-    }
-  }, [userSettings]);
-
-  // Mutation to update user settings
-  const updateUserSettingMutation = useMutation({
-    mutationFn: async ({ key, value }: { key: string; value: string }) => {
-      return apiRequest("POST", "/api/user/settings", { key, value });
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/user/settings"] });
-      toast({
-        title: "Settings updated",
-        description: "Your preferences have been saved.",
-      });
-    },
-    onError: (error) => {
-      console.error("Error updating user settings:", error);
+  const handlePasswordChange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    if (passwordForm.newPassword !== passwordForm.confirmPassword) {
       toast({
         title: "Error",
-        description: "Failed to update settings. Please try again.",
+        description: "New passwords do not match",
         variant: "destructive",
       });
-    },
-  });
+      return;
+    }
 
-  const handleThemeChange = (value: string) => {
-    setTheme(value);
-    updateUserSettingMutation.mutate({ key: "theme", value });
+    if (passwordForm.newPassword.length < 8) {
+      toast({
+        title: "Error",
+        description: "Password must be at least 8 characters long",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsChangingPassword(true);
+    try {
+      const response = await apiRequest("POST", "/api/users/change-password", {
+        currentPassword: passwordForm.currentPassword,
+        newPassword: passwordForm.newPassword,
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.message || "Failed to change password");
+      }
+
+      toast({
+        title: "Success",
+        description: "Password changed successfully",
+      });
+
+      setPasswordForm({
+        currentPassword: "",
+        newPassword: "",
+        confirmPassword: "",
+      });
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to change password",
+        variant: "destructive",
+      });
+    } finally {
+      setIsChangingPassword(false);
+    }
   };
 
   return (
     <div className="container mx-auto p-4">
       <Card>
         <CardHeader>
-          <CardTitle>User Settings</CardTitle>
+          <CardTitle>Account Settings</CardTitle>
         </CardHeader>
         <CardContent className="space-y-6">
-          <div className="space-y-2">
-            <h3 className="text-lg font-medium">Color Theme</h3>
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium">Change Password</h3>
             <p className="text-sm text-muted-foreground">
-              Choose how the application looks to you.
+              Update your password to keep your account secure.
             </p>
-            <div className="flex items-center gap-4">
-              <Select value={theme} onValueChange={handleThemeChange}>
-                <SelectTrigger className="w-[200px]">
-                  <SelectValue placeholder="Select theme" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="light">Light</SelectItem>
-                  <SelectItem value="dark">Dark</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+            
+            <form onSubmit={handlePasswordChange} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="currentPassword">Current Password</Label>
+                <Input
+                  id="currentPassword"
+                  type="password"
+                  value={passwordForm.currentPassword}
+                  onChange={(e) =>
+                    setPasswordForm({ ...passwordForm, currentPassword: e.target.value })
+                  }
+                  required
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="newPassword">New Password</Label>
+                <Input
+                  id="newPassword"
+                  type="password"
+                  value={passwordForm.newPassword}
+                  onChange={(e) =>
+                    setPasswordForm({ ...passwordForm, newPassword: e.target.value })
+                  }
+                  required
+                  minLength={8}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Must be at least 8 characters long
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="confirmPassword">Confirm New Password</Label>
+                <Input
+                  id="confirmPassword"
+                  type="password"
+                  value={passwordForm.confirmPassword}
+                  onChange={(e) =>
+                    setPasswordForm({ ...passwordForm, confirmPassword: e.target.value })
+                  }
+                  required
+                  minLength={8}
+                />
+              </div>
+
+              <Button type="submit" disabled={isChangingPassword}>
+                {isChangingPassword ? "Changing Password..." : "Change Password"}
+              </Button>
+            </form>
           </div>
         </CardContent>
       </Card>
     </div>
   );
 }
+
+export default CoachSettings;

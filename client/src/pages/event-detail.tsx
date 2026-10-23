@@ -25,7 +25,7 @@ export default function EventDetail() {
   });
 
   // Fetch event officials
-  const { data: officials, isLoading: isOfficialsLoading } = useQuery<Official[]>({
+  const { data: officialsData, isLoading: isOfficialsLoading } = useQuery<Official[]>({
     queryKey: [`/api/events/${eventId}/officials`],
     queryFn: async () => {
       const response = await apiRequest("GET", `/api/events/${eventId}/officials`);
@@ -38,7 +38,7 @@ export default function EventDetail() {
   });
 
   // Fetch event teams
-  const { data: teams, isLoading: isTeamsLoading } = useQuery<Team[]>({
+  const { data: teamsData, isLoading: isTeamsLoading } = useQuery<Team[]>({
     queryKey: [`/api/events/${eventId}/teams`],
     queryFn: async () => {
       const response = await apiRequest("GET", `/api/events/${eventId}/teams`);
@@ -49,6 +49,12 @@ export default function EventDetail() {
     },
     enabled: !isNaN(eventId)
   });
+
+  // Sort teams alphabetically by name
+  const teams = teamsData ? [...teamsData].sort((a, b) => a.name.localeCompare(b.name)) : [];
+  
+  // Sort officials alphabetically by last name
+  const officials = officialsData ? [...officialsData].sort((a, b) => a.lastName.localeCompare(b.lastName)) : [];
 
   const isLoading = isEventLoading || isOfficialsLoading || isTeamsLoading;
 

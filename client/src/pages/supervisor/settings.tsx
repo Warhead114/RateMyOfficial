@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { useToast } from "@/hooks/use-toast";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 
-export default function SupervisorSettings() {
+function SupervisorSettings() {
   const [theme, setTheme] = useState<string>("light");
   const { toast } = useToast();
 
@@ -94,3 +94,5 @@ export default function SupervisorSettings() {
     </div>
   );
 }
+
+export default SupervisorSettings;

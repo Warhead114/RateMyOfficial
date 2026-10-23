@@ -5,6 +5,38 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Ensure proper sizing in all contexts including iframes */
+html, body {
+  height: 100%;
+  min-height: 100vh;
+  min-height: 100svh; /* Use small viewport height for mobile browsers */
+}
+
+/* Handle iframe contexts specifically */
+body {
+  margin: 0;
+  padding: 0;
+}
+
+/* Better iframe support */
+body.iframe-context {
+  overflow: hidden;
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100svh; /* Use small viewport height for mobile browsers */
+  height: auto;
+  /* Ensure background covers iframe properly */
+  display: flex;
+  flex-direction: column;
+}
+
+/* Utility class to invert silhouette colors (black to white) */
+.invert-silhouette {
+  filter: invert(1) brightness(1);
+}
+
 @layer base {
   * {
     @apply border-border;
@@ -13,11 +45,93 @@
   body {
     @apply font-sans antialiased bg-background text-foreground;
   }
-  
+
   /* Improve viewport handling for mobile devices */
   html, body {
     @apply w-full overflow-x-hidden;
     -webkit-text-size-adjust: 100%;
+    /* Ensure full height coverage on all browsers */
+    min-height: 100vh;
+    min-height: 100svh; /* Small viewport height for mobile */
+    min-height: 100dvh; /* Dynamic viewport height */
+  }
+
+  /* Ensure text is visible on dark backgrounds with enhanced contrast */
+  .bg-background p, 
+  .bg-background span:not(.text-foreground), 
+  .bg-background div:not(.bg-white):not(.bg-gray-50):not(.bg-card), 
+  .bg-background h1, 
+  .bg-background h2, 
+  .bg-background h3, 
+  .bg-background h4, 
+  .bg-background h5, 
+  .bg-background h6,
+  .bg-background label {
+    @apply text-white;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8), 0 1px 2px rgba(0, 0, 0, 0.9);
+  }
+
+  /* Card content visibility with enhanced shadows */
+  .card:not(.bg-white):not(.bg-gray-50) p, 
+  .card:not(.bg-white):not(.bg-gray-50) span, 
+  .card:not(.bg-white):not(.bg-gray-50) div,
+  .card:not(.bg-white):not(.bg-gray-50) h1,
+  .card:not(.bg-white):not(.bg-gray-50) h2,
+  .card:not(.bg-white):not(.bg-gray-50) h3,
+  .card:not(.bg-white):not(.bg-gray-50) h4,
+  .card:not(.bg-white):not(.bg-gray-50) h5,
+  .card:not(.bg-white):not(.bg-gray-50) h6 {
+    @apply text-white;
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8), 0 1px 2px rgba(0, 0, 0, 0.9);
+  }
+
+  /* Form labels on dark backgrounds */
+  .text-foreground {
+    @apply text-white;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  }
+
+  .text-muted-foreground {
+    @apply text-gray-200;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  }
+
+  /* Enhanced visibility for admin dashboard specific elements */
+  .admin-dashboard-text {
+    @apply text-white font-medium;
+    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9), 0 1px 3px rgba(0, 0, 0, 1);
+  }
+
+  /* Form input overrides - enforce white background with black text */
+  input, textarea, select {
+    @apply text-gray-900 bg-white;
+  }
+
+  input::placeholder, textarea::placeholder {
+    @apply text-gray-500;
+  }
+
+  input:disabled, textarea:disabled, select:disabled {
+    @apply text-gray-500 bg-gray-100;
+  }
+
+  /* Ensure input fields always have white background */
+  input[type="text"],
+  input[type="email"],
+  input[type="password"],
+  input[type="number"],
+  input[type="tel"],
+  input[type="url"],
+  input[type="search"],
+  textarea,
+  select {
+    background-color: white !important;
+    color: #111827 !important;
+  }
+
+  /* Button text should use proper contrast */
+  .btn, button {
+    color: inherit;
   }
 }
 
@@ -28,24 +142,25 @@
     text-transform: uppercase;
     font-weight: 700;
   }
-  
+
   .athletic-text {
     font-family: 'Oswald', sans-serif;
     text-transform: uppercase;
     font-weight: 600;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
   }
-  
+
   /* Card components for consistent responsive behavior */
   .responsive-card {
     @apply bg-image-content rounded-md p-4 transition-all duration-200 hover:shadow-md;
     @apply flex flex-col h-full;
   }
-  
+
   .responsive-card-image {
     @apply w-full aspect-square object-cover rounded-md overflow-hidden;
     @apply sm:aspect-[4/3] md:aspect-square;
   }
-  
+
   .logo-image {
     @apply text-current h-8 w-auto sm:h-10;
   }
@@ -59,7 +174,7 @@
 
   /* Responsive navigation patterns */
   .nav-container {
-    @apply flex flex-col items-center justify-between w-full p-4 gap-4 
+    @apply flex flex-col items-center justify-between w-full p-4 gap-4
            sm:flex-row sm:gap-0;
   }
 
@@ -73,46 +188,59 @@
     @apply grid grid-cols-1 gap-4 p-4
            sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4;
   }
-  
+
   /* Typography adjustments for responsive design */
   .responsive-heading {
     @apply text-xl sm:text-2xl md:text-3xl;
   }
-  
+
   .responsive-text {
     @apply text-sm sm:text-base;
   }
-  
+
+  /* Consistent dark card styling */
+  .dark-card {
+    @apply bg-black/80 backdrop-blur-md border-white/30 shadow-xl;
+  }
+
+  .dark-button {
+    @apply bg-black/80 backdrop-blur-md border-white/30 text-white hover:bg-black/90 hover:text-white shadow-lg;
+  }
+
+  .dark-badge {
+    @apply bg-black/80 backdrop-blur-md border-white/30 text-white hover:bg-black/90 shadow-lg;
+  }
+
   /* Enhanced scrolling for mobile interfaces */
   .scroll-container {
     @apply overflow-y-auto overscroll-contain -webkit-overflow-scrolling-touch;
     max-height: calc(100vh - 12rem);
     scrollbar-width: thin;
   }
-  
+
   .scroll-container-sm {
     @apply overflow-y-auto overscroll-contain -webkit-overflow-scrolling-touch;
     max-height: 60vh;
     scrollbar-width: thin;
   }
-  
+
   /* Custom scrollbar styling */
   .styled-scrollbar::-webkit-scrollbar {
     @apply w-1.5;
   }
-  
+
   .styled-scrollbar::-webkit-scrollbar-track {
     @apply bg-transparent rounded-full;
   }
-  
+
   .styled-scrollbar::-webkit-scrollbar-thumb {
     @apply bg-gray-400 rounded-full;
   }
-  
+
   .styled-scrollbar::-webkit-scrollbar-thumb:hover {
     @apply bg-gray-500;
   }
-  
+
   /* Touch-optimized scrolling area */
   .touch-scroll-area {
     @apply overflow-auto overscroll-contain pb-8;
@@ -122,21 +250,79 @@
     /* ensures form content is scrollable on mobile */
     min-height: 70vh;
   }
-  
+
   /* Horizontal scrolling tabs with visual indicator */
   [role="tablist"] {
-    @apply relative after:absolute after:right-0 after:top-0 after:h-full after:w-8 
+    @apply relative after:absolute after:right-0 after:top-0 after:h-full after:w-8
            after:bg-gradient-to-l after:from-background after:to-transparent after:opacity-70
            after:pointer-events-none after:z-10;
   }
-  
+
   /* Hide scrollbars while maintaining functionality */
   .no-scrollbar {
     -ms-overflow-style: none;  /* Internet Explorer and Edge */
     scrollbar-width: none;  /* Firefox */
   }
-  
+
   .no-scrollbar::-webkit-scrollbar {
     display: none;  /* Safari and Chrome */
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+  .text-shadow-sm {
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+  }
+  .text-shadow-md {
+    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.7);
+  }
+  .text-shadow-lg {
+    text-shadow: 0 4px 8px rgba(0, 0, 0, 0.8);
+  }
+
+  /* Fix bright text on bright backgrounds globally */
+  .tabs-list [data-state="active"] {
+    background: rgba(59, 130, 246, 0.8) !important;
+    color: white !important;
+    border-color: rgba(255, 255, 255, 0.3) !important;
+  }
+
+  .tabs-list button[data-state="active"] {
+    background: rgba(59, 130, 246, 0.8) !important;
+    color: white !important;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8) !important;
+  }
+
+  /* Ensure all buttons have proper contrast */
+  .btn, button {
+    color: white !important;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8) !important;
+  }
+
+  /* Fix select dropdowns and form elements */
+  .select-content, .select-item {
+    background: rgba(0, 0, 0, 0.9) !important;
+    color: white !important;
+    border-color: rgba(255, 255, 255, 0.3) !important;
+  }
+
+  /* Fix badges and status indicators */
+  .badge {
+    background: rgba(0, 0, 0, 0.8) !important;
+    color: white !important;
+    border: 1px solid rgba(255, 255, 255, 0.3) !important;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8) !important;
+  }
+
+  /* Ensure input fields have proper styling */
+  .input {
+    background: white !important;
+    color: #111827 !important;
+    border-color: rgba(255, 255, 255, 0.3) !important;
+  }
+
+  .input::placeholder {
+    color: #6b7280 !important;
   }
 }

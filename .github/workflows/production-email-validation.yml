@@ -1,0 +1,106 @@
+name: Bounded Production email validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: One scoped operation; no worker, scheduler, or arbitrary command
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - inspect
+          - plan-fixtures
+          - plan-capture
+          - plan-send
+          - plan-cleanup
+          - apply
+      acknowledgement:
+        description: For apply only, reviewed operation:sha256 from the private plan report
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ratemyofficial-production-email-validation
+  cancel-in-progress: false
+
+jobs:
+  scoped-validation:
+    # Do not expose an existing private application repository to obtain approvals.
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.private == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: production-email-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Require operator-configured protection and exact source approval
+        env:
+          READY: ${{ vars.EMAIL_VALIDATION_ENVIRONMENT_READY }}
+          APPROVED_SHA: ${{ vars.EMAIL_RUNNER_APPROVED_REVISION }}
+          APPROVED_REF: ${{ vars.EMAIL_VALIDATION_ALLOWED_REF }}
+        run: |
+          test "$READY" = "reviewers-required"
+          test "$APPROVED_SHA" = "$GITHUB_SHA"
+          test "$APPROVED_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$APPROVED_REF" = "$GITHUB_REF"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+      - name: Check out approved source without persisted credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node without a shared dependency cache
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install locked dependencies without lifecycle scripts and compile only the CLI
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node node_modules/esbuild/bin/esbuild scripts/email-validation.ts --platform=node --packages=external --bundle --format=esm --outdir=dist
+      - name: Execute exactly one scoped operation
+        id: execute
+        env:
+          NODE_ENV: production
+          SKIP_DATABASE_INITIALIZATION: '1'
+          EMAIL_PRODUCTION_RUNNER_APPROVED: '1'
+          EMAIL_DELIVERY_MODE: controlled
+          EMAIL_VALIDATION_ENABLED: '1'
+          EMAIL_WORKER_ENABLED: '0'
+          APP_URL: https://www.ratemyofficial.org
+          EMAIL_VALIDATION_ENVIRONMENT_READY: ${{ vars.EMAIL_VALIDATION_ENVIRONMENT_READY }}
+          EMAIL_VALIDATION_ALLOWED_REF: ${{ vars.EMAIL_VALIDATION_ALLOWED_REF }}
+          EMAIL_RUNNER_APPROVED_REVISION: ${{ vars.EMAIL_RUNNER_APPROVED_REVISION }}
+          EMAIL_RUNNER_EXPECTED_DB_HOST: ${{ vars.EMAIL_RUNNER_EXPECTED_DB_HOST }}
+          EMAIL_GITHUB_PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
+          EMAIL_GITHUB_OPERATION: ${{ inputs.operation }}
+          EMAIL_GITHUB_ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+          EMAIL_VALIDATION_FIXTURE_JSON: ${{ secrets.EMAIL_VALIDATION_FIXTURE_JSON }}
+          EMAIL_VALIDATION_INPUT_JSON: ${{ secrets.EMAIL_VALIDATION_INPUT_JSON }}
+          DATABASE_URL: ${{ secrets.RMO_PRODUCTION_DATABASE_URL }}
+          EMAIL_SENSITIVE_PAYLOAD_KEY: ${{ secrets.EMAIL_SENSITIVE_PAYLOAD_KEY }}
+          POSTMARK_SERVER_TOKEN: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_REPLY_TO: ${{ secrets.EMAIL_REPLY_TO }}
+          POSTMARK_MESSAGE_STREAM: ${{ secrets.POSTMARK_MESSAGE_STREAM }}
+        run: node scripts/email-github-runner.mjs
+      - name: Retain only the private structured report for one day
+        if: always() && steps.execute.outcome != 'skipped'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: email-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/email-validation-report/report.json
+          retention-days: 1
+          if-no-files-found: ignore
+      - name: Remove temporary operator files
+        if: always()
+        run: |
+          rm -rf -- .email-validation
+          rm -rf -- "$RUNNER_TEMP/email-validation-report"

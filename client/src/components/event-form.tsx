@@ -51,13 +51,22 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
   const [newTeamName, setNewTeamName] = useState("");
   const [isAddTeamDialogOpen, setIsAddTeamDialogOpen] = useState(false);
 
-  const { data: officials } = useQuery<Official[]>({
+  const { data: officialsData } = useQuery<Official[]>({
     queryKey: ["/api/officials"],
   });
+  const officials = officialsData ? [...officialsData].sort((a, b) => a.lastName.localeCompare(b.lastName)) : [];
 
-  const { data: teams } = useQuery<Team[]>({
+  // Fetch all teams
+  const { data: teamsData, error: teamsError, isLoading: teamsLoading } = useQuery<Team[]>({
     queryKey: ["/api/teams"],
+    staleTime: 0, // Always refetch to get latest teams
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+    refetchInterval: 30000, // Refetch every 30 seconds to catch updates
   });
+
+  // Sort teams alphabetically by name
+  const teams = teamsData ? [...teamsData].sort((a, b) => a.name.localeCompare(b.name)) : [];
 
   const form = useForm<InsertEvent>({
     resolver: zodResolver(insertEventSchema),
@@ -66,7 +75,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
       date: "",
       startTime: "",
       venue: "",
-      eventType: "",
+      eventType: "Dual Match", // Set a default event type instead of empty string
       host: "",
       officials: [],
       teams: []
@@ -75,19 +84,29 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
 
   const createTeamMutation = useMutation({
     mutationFn: async (data: InsertTeam) => {
-      return await apiRequest("POST", "/api/teams", data);
+      const response = await apiRequest("POST", "/api/teams", data);
+      return response.json();
     },
-    onSuccess: (newTeam: any) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/teams"] });
+    onSuccess: async (newTeam: any) => {
+      // Use multiple cache invalidation strategies to ensure the UI updates
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["/api/teams"] }),
+        queryClient.refetchQueries({ queryKey: ["/api/teams"] }),
+        queryClient.removeQueries({ queryKey: ["/api/teams"] }),
+      ]);
+
+      // Wait a moment for the queries to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       if (newTeam && newTeam.id) {
         setSelectedTeams(prev => [...prev, newTeam.id]);
       }
       setNewTeamName("");
       setIsAddTeamDialogOpen(false);
-      
+
       toast({
         title: "Success!",
-        description: "Team has been created!",
+        description: "Team has been created and is now available for selection!",
       });
     },
     onError: (error) => {
@@ -101,40 +120,56 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
 
   const mutation = useMutation({
     mutationFn: async (data: InsertEvent) => {
-      // Format the date to avoid timezone issues
-      let formattedData = { ...data };
-      
-      // If the date is a string (from the date input), use the formatDateForStorage utility
-      // to ensure it's properly formatted for Eastern Time Zone
-      if (typeof formattedData.date === 'string') {
-        formattedData.date = formatDateForStorage(formattedData.date);
-      }
-      
-      return await apiRequest("POST", "/api/events", {
-        ...formattedData,
+      // Format the date properly for storage to avoid timezone issues
+      const formattedData = {
+        ...data,
+        date: typeof data.date === 'string' ? formatDateForStorage(data.date) : data.date,
         officials: selectedOfficials,
         teams: selectedTeams
-      });
+      };
+
+      const response = await apiRequest("POST", "/api/events", formattedData);
+      return response.json(); // Assuming the API returns JSON
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       console.log('Event creation successful:', data);
-      
-      // Use more aggressive query invalidation to ensure all data is refreshed
+
+      // Use multiple cache invalidation strategies to ensure the UI updates
       queryClient.invalidateQueries({
         predicate: (query) => {
           // Invalidate any query related to events
           const queryKey = Array.isArray(query.queryKey) ? query.queryKey[0] : query.queryKey;
           const stringKey = String(queryKey);
           const shouldInvalidate = stringKey.includes('/api/events');
-          
+
           if (shouldInvalidate) {
             console.log('Invalidating query with key:', queryKey);
           }
-          
+
           return shouldInvalidate;
         },
       });
-      
+
+      // Use multiple cache invalidation strategies to ensure all event-related UI updates
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["/api/events"] }),
+        queryClient.refetchQueries({ queryKey: ["/api/events"] }),
+        queryClient.removeQueries({ queryKey: ["/api/events"] }),
+      ]);
+
+      // Also invalidate any event-related queries that might be cached
+      queryClient.invalidateQueries({
+        predicate: (query) => {
+          const queryKey = query.queryKey;
+          return Array.isArray(queryKey) && queryKey.some(key => 
+            typeof key === 'string' && key.includes('events')
+          );
+        },
+      });
+
+      // Wait a moment for the queries to complete
+      await new Promise(resolve => setTimeout(resolve, 200));
+
       form.reset();
       setSelectedOfficials([]);
       setSelectedTeams([]);
@@ -150,7 +185,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
         console.log('Navigating to events page after creation');
         setLocation("/events");
       }, 1500);
-      
+
       onSuccess();
     },
     onError: (error) => {
@@ -170,7 +205,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
           name="name"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Event Name</FormLabel>
+              <FormLabel className="text-foreground font-medium">Event Name</FormLabel>
               <FormControl>
                 <Input {...field} />
               </FormControl>
@@ -184,7 +219,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
           name="date"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Date</FormLabel>
+              <FormLabel className="text-foreground font-medium">Date</FormLabel>
               <FormControl>
                 <Input 
                   type="date" 
@@ -202,7 +237,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
           name="startTime"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Start Time</FormLabel>
+              <FormLabel className="text-foreground font-medium">Start Time</FormLabel>
               <FormControl>
                 <Input 
                   type="time" 
@@ -267,19 +302,25 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
               </SelectTrigger>
               <SelectContent>
                 <ScrollArea className="h-[200px]">
-                  {teams?.map((team) => (
-                    <SelectItem
-                      key={team.id}
-                      value={team.id.toString()}
-                      disabled={selectedTeams.includes(team.id)}
-                    >
-                      {team.name}
-                    </SelectItem>
-                  ))}
+                  {teamsLoading ? (
+                    <SelectItem value="loading" disabled>Loading teams...</SelectItem>
+                  ) : teams && teams.length > 0 ? (
+                    teams.map((team) => (
+                      <SelectItem
+                        key={team.id}
+                        value={team.id.toString()}
+                        disabled={selectedTeams.includes(team.id)}
+                      >
+                        {team.name}
+                      </SelectItem>
+                    ))
+                  ) : (
+                    <SelectItem value="no-teams" disabled>No teams available</SelectItem>
+                  )}
                 </ScrollArea>
               </SelectContent>
             </Select>
-            
+
             <Dialog open={isAddTeamDialogOpen} onOpenChange={setIsAddTeamDialogOpen}>
               <DialogTrigger asChild>
                 <Button variant="outline" type="button" className="sm:whitespace-nowrap">
@@ -297,6 +338,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
                     value={newTeamName} 
                     onChange={(e) => setNewTeamName(e.target.value)} 
                     placeholder="Enter team name"
+                    className="bg-white border-gray-300 text-gray-900"
                   />
                 </div>
                 <DialogFooter>
@@ -337,7 +379,7 @@ export default function EventForm({ onSuccess }: { onSuccess: () => void }) {
               </CardContent>
             </Card>
           )}
-          
+
           {/* Keep a hidden host field for backward compatibility */}
           <FormField
             control={form.control}

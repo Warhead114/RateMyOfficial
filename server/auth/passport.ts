@@ -18,6 +18,7 @@ declare global {
       yearsExperience: number | null;
       photoUrl: string | null;
       isVerified: boolean;
+      sessionVersion: number;
     }
   }
 }
@@ -50,7 +51,8 @@ export function configurePassport(passport: import("passport").PassportStatic) {
             region: user.region,
             yearsExperience: user.yearsExperience,
             photoUrl: user.photoUrl,
-            isVerified: user.isVerified || false
+            isVerified: user.isVerified || false,
+            sessionVersion: user.sessionVersion,
           });
         } catch (err) {
           return done(err);
@@ -60,13 +62,22 @@ export function configurePassport(passport: import("passport").PassportStatic) {
   );
 
   passport.serializeUser((user, done) => {
-    done(null, user.id);
+    done(null, {
+      id: user.id,
+      sessionVersion: user.sessionVersion,
+    });
   });
 
-  passport.deserializeUser(async (id: number, done) => {
+  passport.deserializeUser(async (
+    serialized: number | { id: number; sessionVersion?: number },
+    done,
+  ) => {
     try {
+      const id = typeof serialized === "number" ? serialized : serialized.id;
+      const sessionVersion =
+        typeof serialized === "number" ? 0 : serialized.sessionVersion ?? 0;
       const user = await storage.getUserById(id);
-      if (!user) {
+      if (!user || user.sessionVersion !== sessionVersion) {
         return done(null, false);
       }
       done(null, {
@@ -81,7 +92,8 @@ export function configurePassport(passport: import("passport").PassportStatic) {
         region: user.region,
         yearsExperience: user.yearsExperience,
         photoUrl: user.photoUrl,
-        isVerified: user.isVerified || false
+        isVerified: user.isVerified || false,
+        sessionVersion: user.sessionVersion,
       });
     } catch (err) {
       done(err);

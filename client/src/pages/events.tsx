@@ -3,6 +3,15 @@ import { Event, User, Official, Team } from "@shared/schema";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Search, Filter, Edit, Trash, Users, ListChecks } from "lucide-react";
 import { useState, useEffect } from "react";
 import { Link } from "wouter";
@@ -13,11 +22,14 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { formatInEastern, formatTimeTo12Hour } from "@/lib/utils";
+import { Loading } from "@/components/ui/loading";
 
 export default function Events() {
   const { toast } = useToast();
   const [searchQuery, setSearchQuery] = useState("");
   const [isSearching, setIsSearching] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [eventToDelete, setEventToDelete] = useState<number | null>(null);
 
   // Check if user is authenticated and has permission
   const { data: user } = useQuery<User>({
@@ -27,14 +39,14 @@ export default function Events() {
   const canManageEvents = user?.role === "admin" || user?.userType === "Regional Supervisor";
 
   // Fetch events
-  const { data: events, isLoading, dataUpdatedAt } = useQuery<Event[]>({
+  const { data: events, isLoading, dataUpdatedAt, refetch: refetchEvents } = useQuery<Event[]>({
     queryKey: ["/api/events"],
     enabled: canManageEvents,
     refetchOnWindowFocus: true, // Refetch when window regains focus
     refetchOnMount: true, // Refetch when component mounts
-    staleTime: 0 // Consider data stale immediately
+    staleTime: 0, // Always consider data stale to ensure fresh fetches
   });
-  
+
   // State to store event officials and teams
   const [eventDataMap, setEventDataMap] = useState<{
     [eventId: number]: {
@@ -42,82 +54,149 @@ export default function Events() {
       teams: Team[];
     }
   }>({});
-  
+
   // State to track loading status of event details
   const [isLoadingDetails, setIsLoadingDetails] = useState(false);
-  
+
   // Fetch officials and teams for each event
   useEffect(() => {
-    if (!events || events.length === 0) return;
-    
+    if (!events || events.length === 0) {
+      setEventDataMap({});
+      setIsLoadingDetails(false);
+      return;
+    }
+
+    let isMounted = true;
+
     const fetchEventData = async () => {
       console.log('Fetching event details for', events.length, 'events');
       setIsLoadingDetails(true);
-      const dataMap: typeof eventDataMap = {};
-      
+      const dataMap: {
+        [eventId: number]: {
+          officials: Official[];
+          teams: Team[];
+        }
+      } = {};
+
       try {
-        // Use Promise.all to fetch all event details in parallel
-        await Promise.all(events.map(async (event) => {
+        // Fetch all event details in parallel
+        const fetchPromises = events.map(async (event) => {
           try {
             console.log(`Fetching details for event ${event.id}: ${event.name}`);
             const [officialsRes, teamsRes] = await Promise.all([
-              apiRequest("GET", `/api/events/${event.id}/officials`),
-              apiRequest("GET", `/api/events/${event.id}/teams`)
+              fetch(`/api/events/${event.id}/officials`, { credentials: 'include' }),
+              fetch(`/api/events/${event.id}/teams`, { credentials: 'include' })
             ]);
-            
-            const officials: Official[] = await officialsRes.json();
-            const teams: Team[] = await teamsRes.json();
-            
+
+            const officialsData = officialsRes.ok ? await officialsRes.json() : [];
+            const officials = Array.isArray(officialsData) ? [...officialsData].sort((a: Official, b: Official) => a.lastName.localeCompare(b.lastName)) : [];
+            const teamsData = teamsRes.ok ? await teamsRes.json() : [];
+            const teams = Array.isArray(teamsData) ? [...teamsData].sort((a: Team, b: Team) => a.name.localeCompare(b.name)) : [];
+
             console.log(`Event ${event.id} has ${officials.length} officials and ${teams.length} teams`);
-            dataMap[event.id] = { officials, teams };
+            return { eventId: event.id, officials, teams };
           } catch (error) {
             console.error(`Error fetching data for event ${event.id}:`, error);
-            dataMap[event.id] = { officials: [], teams: [] };
+            return { eventId: event.id, officials: [], teams: [] };
           }
-        }));
+        });
+
+        const results = await Promise.all(fetchPromises);
         
-        setEventDataMap(dataMap);
+        // Build the data map from results
+        results.forEach(({ eventId, officials, teams }) => {
+          dataMap[eventId] = { officials, teams };
+        });
+
+        console.log('Complete event data map:', dataMap);
+        if (isMounted) {
+          setEventDataMap(dataMap);
+          setIsLoadingDetails(false);
+        }
       } catch (error) {
         console.error('Error fetching event details:', error);
-      } finally {
-        setIsLoadingDetails(false);
+        if (isMounted) {
+          setIsLoadingDetails(false);
+        }
       }
     };
-    
-    fetchEventData();
-  }, [events, dataUpdatedAt]); // Re-fetch when events or dataUpdatedAt changes
 
-  const deleteMutation = useMutation({
+    fetchEventData();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [events, dataUpdatedAt]); // Re-fetch when events or data timestamp changes
+
+  // Delete event mutation
+  const deleteEventMutation = useMutation({
     mutationFn: async (eventId: number) => {
-      await apiRequest("DELETE", `/api/events/${eventId}`);
+      console.log('Deleting event:', eventId);
+      const response = await apiRequest("DELETE", `/api/events/${eventId}`);
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ message: "Failed to delete event" }));
+        throw new Error(error.message || "Failed to delete event");
+      }
+      return response.json();
     },
-    onSuccess: () => {
+    onSuccess: async () => {
+      console.log('Event deleted successfully, invalidating cache...');
       toast({
-        title: "Success",
-        description: "Event has been deleted"
+        title: "Event deleted",
+        description: "The event has been successfully deleted",
       });
-      queryClient.invalidateQueries({ queryKey: ["/api/events"] });
+      
+      // Clear the event data map immediately
+      setEventDataMap({});
+      
+      // Force complete cache removal and refetch
+      queryClient.removeQueries({ queryKey: ["/api/events"] });
+      
+      // Invalidate all event-related queries
+      await queryClient.invalidateQueries({ 
+        predicate: (query) => {
+          const key = Array.isArray(query.queryKey) ? query.queryKey[0] : query.queryKey;
+          return String(key).includes('/api/events');
+        }
+      });
+      
+      // Force immediate refetch
+      await queryClient.refetchQueries({ 
+        queryKey: ["/api/events"], 
+        type: 'active',
+        exact: true
+      });
+      
+      console.log('Cache invalidation complete');
     },
-    onError: (error) => {
+    onError: (error: any) => {
+      console.error("Delete event error:", error);
       toast({
         title: "Error",
-        description: "Failed to delete event",
-        variant: "destructive"
+        description: error.message || "Failed to delete event",
+        variant: "destructive",
       });
-    }
+    },
   });
 
   const handleDelete = (eventId: number) => {
-    if (confirm("Are you sure you want to delete this event?")) {
-      deleteMutation.mutate(eventId);
+    setEventToDelete(eventId);
+    setDeleteConfirmOpen(true);
+  };
+
+  const confirmDelete = () => {
+    if (eventToDelete) {
+      deleteEventMutation.mutate(eventToDelete);
+      setDeleteConfirmOpen(false);
+      setEventToDelete(null);
     }
   };
 
   if (!canManageEvents) {
     return (
       <div className="text-center space-y-4">
-        <h1 className="text-4xl font-bold tracking-tight">Access Denied</h1>
-        <p className="text-xl text-muted-foreground">
+        <h1 className="text-4xl font-bold tracking-tight text-white drop-shadow-lg">Access Denied</h1>
+        <p className="text-xl text-white/90 drop-shadow-md">
           You don't have permission to manage events.
         </p>
       </div>
@@ -127,8 +206,8 @@ export default function Events() {
   return (
     <div className="space-y-8">
       <div className="text-center space-y-4">
-        <h1 className="text-4xl font-bold tracking-tight">Event Management</h1>
-        <p className="text-xl text-muted-foreground">
+        <h1 className="text-4xl font-bold tracking-tight text-white drop-shadow-lg">Event Management</h1>
+        <p className="text-xl text-white/90 drop-shadow-md">
           Create and manage wrestling events
         </p>
       </div>
@@ -140,10 +219,10 @@ export default function Events() {
         </TabsList>
 
         <TabsContent value="manage" className="space-y-4">
-          <Card>
+          <Card className="bg-black/30 backdrop-blur-sm border-white/20">
             <CardHeader>
-              <CardTitle>Event List</CardTitle>
-              <CardDescription>View and manage all wrestling events</CardDescription>
+              <CardTitle className="text-white drop-shadow-lg">Event List</CardTitle>
+              <CardDescription className="text-white/80 drop-shadow-md">View and manage all wrestling events</CardDescription>
             </CardHeader>
             <CardContent>
               {isLoading ? (
@@ -153,65 +232,62 @@ export default function Events() {
                   ))}
                 </div>
               ) : isLoadingDetails ? (
-                <div className="space-y-4">
-                  <div className="flex items-center justify-center py-8">
-                    <div className="animate-spin h-6 w-6 border-2 border-primary rounded-full border-t-transparent mr-2"></div>
-                    <span>Loading event details...</span>
-                  </div>
+                <div className="flex items-center justify-center py-8">
+                  <Loading />
                 </div>
               ) : !events?.length ? (
-                <div className="text-center py-8 text-muted-foreground">
+                <div className="text-center py-8 text-white/80 drop-shadow-md">
                   No events found
                 </div>
               ) : (
                 <div className="space-y-4">
                   {events.map((event) => (
-                    <Card key={event.id}>
+                    <Card key={event.id} className="bg-black/20 backdrop-blur-sm border-white/20">
                       <CardContent className="pt-6">
                         <div className="flex flex-col sm:flex-row justify-between sm:items-start gap-4">
                           <div className="w-full">
-                            <h3 className="font-medium text-lg">{event.name}</h3>
-                            <div className="text-sm text-muted-foreground space-y-1">
+                            <h3 className="font-medium text-lg text-white drop-shadow-lg">{event.name}</h3>
+                            <div className="text-sm text-white/80 drop-shadow-md space-y-1">
                               <p>Date: {formatInEastern(event.date, 'PPP')}</p>
                               <p>Time: {event.startTime ? formatTimeTo12Hour(event.startTime) : formatInEastern(event.date, 'p')}</p>
                               <p>Venue: {event.venue}</p>
                               <p>Type: {event.eventType}</p>
-                              
-                              {/* Officials */}
-                              <div className="mt-3">
-                                <div className="flex items-center gap-2 mb-1">
-                                  <Users className="h-4 w-4" />
-                                  <span className="font-medium">Officials:</span>
-                                </div>
-                                {eventDataMap[event.id]?.officials?.length > 0 ? (
-                                  <div className="flex flex-wrap gap-1 mt-1">
-                                    {eventDataMap[event.id].officials.map((official) => (
-                                      <Badge key={official.id} variant="outline" className="flex items-center gap-1 text-xs sm:text-sm">
-                                        {official.firstName} {official.lastName}
-                                      </Badge>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <p className="text-muted-foreground text-xs">No officials assigned</p>
-                                )}
-                              </div>
-                              
+
                               {/* Teams */}
                               <div className="mt-3">
                                 <div className="flex items-center gap-2 mb-1">
-                                  <ListChecks className="h-4 w-4" />
-                                  <span className="font-medium">Teams:</span>
+                                  <ListChecks className="h-4 w-4 text-white drop-shadow-lg" />
+                                  <span className="font-medium text-white drop-shadow-lg">Teams ({eventDataMap[event.id]?.teams?.length || 0}):</span>
                                 </div>
-                                {eventDataMap[event.id]?.teams?.length > 0 ? (
+                                {eventDataMap[event.id]?.teams && eventDataMap[event.id].teams.length > 0 ? (
                                   <div className="flex flex-wrap gap-1 mt-1">
                                     {eventDataMap[event.id].teams.map((team) => (
-                                      <Badge key={team.id} variant="secondary" className="flex items-center gap-1 text-xs sm:text-sm">
+                                      <Badge key={team.id} variant="secondary" className="flex items-center gap-1 text-xs sm:text-sm bg-white/30 text-white border-white/50 drop-shadow-lg">
                                         {team.name}
                                       </Badge>
                                     ))}
                                   </div>
                                 ) : (
-                                  <p className="text-muted-foreground text-xs">No teams assigned</p>
+                                  <p className="text-white/90 text-xs drop-shadow-lg">No teams assigned</p>
+                                )}
+                              </div>
+
+                              {/* Officials */}
+                              <div className="mt-3">
+                                <div className="flex items-center gap-2 mb-1">
+                                  <Users className="h-4 w-4 text-white drop-shadow-lg" />
+                                  <span className="font-medium text-white drop-shadow-lg">Officials ({eventDataMap[event.id]?.officials?.length || 0}):</span>
+                                </div>
+                                {eventDataMap[event.id]?.officials && eventDataMap[event.id].officials.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1 mt-1">
+                                    {eventDataMap[event.id].officials.map((official) => (
+                                      <Badge key={official.id} variant="outline" className="flex items-center gap-1 text-xs sm:text-sm bg-white/30 text-white border-white/50 drop-shadow-lg">
+                                        {official.firstName} {official.lastName}
+                                      </Badge>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <p className="text-white/90 text-xs drop-shadow-lg">No officials assigned</p>
                                 )}
                               </div>
                             </div>
@@ -244,10 +320,10 @@ export default function Events() {
         </TabsContent>
 
         <TabsContent value="add">
-          <Card>
+          <Card className="bg-black/30 backdrop-blur-sm border-white/20">
             <CardHeader>
-              <CardTitle>Create New Event</CardTitle>
-              <CardDescription>Add a new wrestling event</CardDescription>
+              <CardTitle className="text-white drop-shadow-lg">Create New Event</CardTitle>
+              <CardDescription className="text-white/80 drop-shadow-md">Add a new wrestling event</CardDescription>
             </CardHeader>
             <CardContent>
               <EventForm onSuccess={() => {}} />
@@ -255,6 +331,44 @@ export default function Events() {
           </Card>
         </TabsContent>
       </Tabs>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Deletion</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this event? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline">Cancel</Button>
+            </DialogClose>
+            <Button
+              variant="destructive"
+              onClick={confirmDelete}
+              disabled={deleteEventMutation.isPending}
+            >
+              {deleteEventMutation.isPending ? (
+                <div className="flex items-center justify-center">
+                  <div className="relative mr-2">
+                    <div className="w-4 h-4 bg-white rounded-full animate-pulse"></div>
+                    <img 
+                      src="/uploads/wrestlers-silhouette.png" 
+                      alt="" 
+                      className="absolute inset-0 w-3 h-3 m-auto object-contain animate-pulse"
+                    />
+                  </div>
+                  Deleting...
+                </div>
+              ) : (
+                "Delete"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

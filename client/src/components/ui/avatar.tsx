@@ -21,13 +21,33 @@ Avatar.displayName = AvatarPrimitive.Root.displayName
 const AvatarImage = React.forwardRef<
   React.ElementRef<typeof AvatarPrimitive.Image>,
   React.ComponentPropsWithoutRef<typeof AvatarPrimitive.Image>
->(({ className, ...props }, ref) => (
-  <AvatarPrimitive.Image
-    ref={ref}
-    className={cn("aspect-square h-full w-full", className)}
-    {...props}
-  />
-))
+>(({ className, src, ...props }, ref) => {
+  // Normalize photo URLs to handle both Object Storage and local paths
+  let normalizedSrc = src && typeof src === 'string' ? src : '';
+
+  if (normalizedSrc) {
+    // If it's an Object Storage path (starts with coaches/ or reviews/), use the /storage endpoint
+    if (normalizedSrc.startsWith('coaches/') || normalizedSrc.startsWith('reviews/')) {
+      normalizedSrc = `/storage/${normalizedSrc}`;
+    } else {
+      // Otherwise, normalize slashes for local paths
+      normalizedSrc = normalizedSrc.replace(/\\/g, '/');
+      if (!normalizedSrc.startsWith('/')) {
+        normalizedSrc = `/${normalizedSrc}`;
+      }
+    }
+  }
+
+  return (
+    <AvatarPrimitive.Image
+      ref={ref}
+      className={cn("aspect-square h-full w-full object-cover", className)}
+      src={normalizedSrc}
+      {...props}
+      crossOrigin="anonymous"
+    />
+  );
+})
 AvatarImage.displayName = AvatarPrimitive.Image.displayName
 
 const AvatarFallback = React.forwardRef<
