@@ -1,12 +1,14 @@
 // GitHub-only adapter. Never imported by application startup or deployment.
 import { createHash } from "node:crypto";
-import { mkdir, writeFile, unlink } from "node:fs/promises";
+import { mkdir, writeFile, unlink, lstat, realpath } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import pg from "pg";
 import { validateRunnerEnvironment } from "./email-production-runner.mjs";
+import { PUBLIC_RUNNER_POLICY, validateGitHubContext, verifyGitHubProtection } from "./email-github-protection.mjs";
+import { reportPublicKey, sealReport, writeSealedReport } from "./email-report-crypto.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const types = new Set(["evaluation_submitted", "password_reset", "event_created", "event_reminder"]);
@@ -26,16 +28,9 @@ const parse = value => {
 const isEmail = v => typeof v === "string" && v === v.trim().toLowerCase() &&
   v.length <= 320 && /^[^@\s*?]+@[^@\s*?]+\.[^@\s*?]+$/.test(v);
 
-export function buildInvocation(env) {
+export function buildInvocation(env, policy = PUBLIC_RUNNER_POLICY) {
   validateRunnerEnvironment(env);
-  demand(env.GITHUB_ACTIONS === "true" && env.GITHUB_EVENT_NAME === "workflow_dispatch");
-  demand(env.GITHUB_SERVER_URL === "https://github.com" && env.RUNNER_ENVIRONMENT === "github-hosted");
-  demand(env.EMAIL_GITHUB_PRIVATE_REPOSITORY === "true" && env.GITHUB_RUN_ATTEMPT === "1");
-  demand(env.EMAIL_VALIDATION_ENVIRONMENT_READY === "reviewers-required");
-  demand(/^refs\/heads\/.+$/.test(env.EMAIL_VALIDATION_ALLOWED_REF || "") &&
-    env.GITHUB_REF === env.EMAIL_VALIDATION_ALLOWED_REF);
-  demand(env.GITHUB_SHA === env.EMAIL_RUNNER_APPROVED_REVISION &&
-    env.GITHUB_WORKFLOW_SHA === env.EMAIL_RUNNER_APPROVED_REVISION);
+  validateGitHubContext(env, policy);
   const fixture = parse(env.EMAIL_VALIDATION_FIXTURE_JSON);
   demand(/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(fixture.runId));
   const recipients = [fixture.coachEmail, fixture.alternateCoachEmail,
@@ -94,8 +89,9 @@ export function checkBudget(reservations, nextSlots) {
   demand(reservations.reduce((n, r) => n + Number(r.max_attempts), 0) + nextSlots <= 10);
 }
 
-// Ignore pool messages. Only recognized JSON results enter the private artifact.
+// Ignore raw pool messages, but refuse ambiguous/multiple structured results.
 export function parseCliResult(text) {
+  const results = [];
   for (let start = 0; start < text.length; start++) {
     if ((start > 0 && text[start - 1] !== "\n") || !"{[".includes(text[start])) continue;
     let depth = 0, quoted = false, escaped = false;
@@ -108,29 +104,64 @@ export function parseCliResult(text) {
       } else if (c === '"') quoted = true;
       else if ("{[".includes(c)) depth++;
       else if ("}]".includes(c) && --depth === 0) {
-        try { return JSON.parse(text.slice(start, end + 1)); } catch { break; }
+        try {
+          results.push(JSON.parse(text.slice(start, end + 1)));
+          start = end;
+        } catch {}
+        break;
       }
     }
   }
-  throw new Error("No structured CLI result; inspect durable state before retrying");
+  demand(results.length === 1);
+  return results[0];
 }
 
-async function main() {
-  const invocation = buildInvocation(process.env);
-  demand(process.env.RUNNER_TEMP && resolve(process.env.RUNNER_TEMP) !== root);
-  const reportDirectory = resolve(process.env.RUNNER_TEMP, "email-validation-report");
+export function childEnvironment(env) {
+  const names = ["PATH", "HOME", "LANG", "NODE_ENV", "DATABASE_URL",
+    "SKIP_DATABASE_INITIALIZATION", "EMAIL_PRODUCTION_RUNNER_APPROVED",
+    "EMAIL_DELIVERY_MODE", "EMAIL_VALIDATION_ENABLED", "EMAIL_WORKER_ENABLED",
+    "EMAIL_RUNNER_APPROVED_REVISION", "EMAIL_RUNNER_EXPECTED_DB_HOST", "APP_URL",
+    "EMAIL_SENSITIVE_PAYLOAD_KEY", "POSTMARK_SERVER_TOKEN", "EMAIL_FROM",
+    "EMAIL_REPLY_TO", "POSTMARK_MESSAGE_STREAM"];
+  return { ...Object.fromEntries(names.filter(n => env[n] !== undefined).map(n => [n, env[n]])),
+    EMAIL_RUNNER_MACHINE_OUTPUT: "1" };
+}
+
+async function secureDirectory(directory, fresh = false) {
+  await mkdir(directory, { mode: 0o700 }).catch(error => {
+    if (fresh || error.code !== "EEXIST") throw new Error("Scoped validation refused");
+  });
+  const metadata = await lstat(directory);
+  demand(metadata.isDirectory() && !metadata.isSymbolicLink() && (metadata.mode & 0o077) === 0);
+}
+
+export async function runScopedValidation(env, dependencies = {}) {
+  const invocation = buildInvocation(env, dependencies.policy ?? PUBLIC_RUNNER_POLICY);
+  demand(!env.EMAIL_REPORT_PRIVATE_KEY && !env.EMAIL_REPORT_DECRYPTION_KEY);
+  const recipient = reportPublicKey(env.EMAIL_REPORT_PUBLIC_KEY, env.EMAIL_REPORT_KEY_SHA256);
+  // Fail before GitHub/DB/provider access if local cryptography is unavailable.
+  sealReport({ encryptionPreflight: true }, recipient);
+  demand(isAbsolute(env.RUNNER_TEMP || ""));
+  const temporaryRoot = await realpath(env.RUNNER_TEMP);
+  const outside = relative(root, temporaryRoot);
+  demand(outside.startsWith(".." + sep) && !root.startsWith(temporaryRoot + sep));
+  await (dependencies.verifyProtection ?? verifyGitHubProtection)(env);
+  const reportDirectory = resolve(temporaryRoot, "email-validation-sealed");
+  await secureDirectory(reportDirectory, true);
   const inputPath = resolve(root, ".email-validation/github-input.json");
   let client;
+  let inputCreated = false;
   let success = false;
   let result;
-  await mkdir(reportDirectory, { recursive: true, mode: 0o700 });
   try {
     if (invocation.input) {
-      await mkdir(dirname(inputPath), { recursive: true, mode: 0o700 });
+      await secureDirectory(dirname(inputPath));
       await writeFile(inputPath, JSON.stringify(invocation.input), { mode: 0o600, flag: "wx" });
+      inputCreated = true;
     }
     if (invocation.sendSlots) {
-      client = new pg.Client({ connectionString: process.env.DATABASE_URL,
+      const factory = dependencies.clientFactory ?? (config => new pg.Client(config));
+      client = factory({ connectionString: env.DATABASE_URL,
         connectionTimeoutMillis: 10000, statement_timeout: 10000, query_timeout: 10000 });
       await client.connect();
       // Only SELECTs here; no new schema, budget table or record mutation.
@@ -143,26 +174,26 @@ async function main() {
         [invocation.runId]);
       checkBudget(reservations.rows, invocation.sendSlots);
     }
-    const child = spawnSync(process.execPath,
+    const child = (dependencies.spawn ?? spawnSync)(process.execPath,
       ["scripts/email-production-runner.mjs", ...invocation.args],
-      { cwd: root, env: process.env, encoding: "utf8", timeout: 160000, maxBuffer: 1048576 });
+      { cwd: root, env: childEnvironment(env), encoding: "utf8", timeout: 160000, maxBuffer: 1048576 });
     demand(!child.error && child.status === 0);
     result = parseCliResult(child.stdout);
     success = true;
   } finally {
     await client?.end().catch(() => {});
-    await unlink(inputPath).catch(() => {});
-    await writeFile(resolve(reportDirectory, "report.json"), JSON.stringify({
+    if (inputCreated) await unlink(inputPath);
+    await writeSealedReport(reportDirectory, {
       operation: invocation.operation, runId: invocation.runId, success,
+      sourceRevision: env.GITHUB_SHA, workflowRun: env.GITHUB_RUN_ID,
       ...(success ? { result } : { action: "Stop; inspect durable state and provider before retrying" }),
-    }, null, 2), { mode: 0o600, flag: "wx" });
+    }, recipient);
   }
   demand(success);
-  console.log("Scoped operation completed. Review the private report; no automatic next step.");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(() => {
+  runScopedValidation(process.env).catch(() => {
     console.error("Scoped operation refused or interrupted. No automatic retry; inspect before proceeding.");
     process.exitCode = 1;
   });

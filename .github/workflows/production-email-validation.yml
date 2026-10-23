@@ -16,13 +16,10 @@ on:
           - plan-send
           - plan-cleanup
           - apply
-      acknowledgement:
-        description: For apply only, reviewed operation:sha256 from the private plan report
-        required: false
-        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ratemyofficial-production-email-validation
@@ -30,7 +27,8 @@ concurrency:
 
 jobs:
   scoped-validation:
-    # Do not expose an existing private application repository to obtain approvals.
+    # ACTIVATION HOLD: public jobs stay skipped until a separately approved change.
+    # The adapter independently holds PUBLIC_RUNNER_POLICY.enabled=false.
     if: github.event_name == 'workflow_dispatch' && github.event.repository.private == true && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     environment: production-email-validation
     runs-on: ubuntu-24.04
@@ -78,10 +76,17 @@ jobs:
           EMAIL_VALIDATION_ENVIRONMENT_READY: ${{ vars.EMAIL_VALIDATION_ENVIRONMENT_READY }}
           EMAIL_VALIDATION_ALLOWED_REF: ${{ vars.EMAIL_VALIDATION_ALLOWED_REF }}
           EMAIL_RUNNER_APPROVED_REVISION: ${{ vars.EMAIL_RUNNER_APPROVED_REVISION }}
-          EMAIL_RUNNER_EXPECTED_DB_HOST: ${{ vars.EMAIL_RUNNER_EXPECTED_DB_HOST }}
+          EMAIL_RUNNER_EXPECTED_DB_HOST: ${{ secrets.EMAIL_RUNNER_EXPECTED_DB_HOST }}
           EMAIL_GITHUB_PRIVATE_REPOSITORY: ${{ github.event.repository.private }}
+          GITHUB_TOKEN: ${{ github.token }}
+          EMAIL_REPORT_PUBLIC_KEY: ${{ secrets.EMAIL_REPORT_PUBLIC_KEY }}
+          EMAIL_REPORT_KEY_SHA256: ${{ vars.EMAIL_REPORT_KEY_SHA256 }}
+          NODE_OPTIONS: ''
+          NODE_V8_COVERAGE: ''
+          ACTIONS_STEP_DEBUG: ${{ secrets.ACTIONS_STEP_DEBUG }}
+          ACTIONS_RUNNER_DEBUG: ${{ secrets.ACTIONS_RUNNER_DEBUG }}
           EMAIL_GITHUB_OPERATION: ${{ inputs.operation }}
-          EMAIL_GITHUB_ACKNOWLEDGEMENT: ${{ inputs.acknowledgement }}
+          EMAIL_GITHUB_ACKNOWLEDGEMENT: ${{ inputs.operation == 'apply' && secrets.EMAIL_VALIDATION_ACKNOWLEDGEMENT || '' }}
           EMAIL_VALIDATION_FIXTURE_JSON: ${{ secrets.EMAIL_VALIDATION_FIXTURE_JSON }}
           EMAIL_VALIDATION_INPUT_JSON: ${{ secrets.EMAIL_VALIDATION_INPUT_JSON }}
           DATABASE_URL: ${{ secrets.RMO_PRODUCTION_DATABASE_URL }}
@@ -90,17 +95,33 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_REPLY_TO: ${{ secrets.EMAIL_REPLY_TO }}
           POSTMARK_MESSAGE_STREAM: ${{ secrets.POSTMARK_MESSAGE_STREAM }}
-        run: node scripts/email-github-runner.mjs
-      - name: Retain only the private structured report for one day
+        run: |
+          umask 077
+          mkdir -- "$RUNNER_TEMP/email-validation-private"
+          set -o noclobber
+          if ! node scripts/email-github-runner.mjs > "$RUNNER_TEMP/email-validation-private/process.log" 2>&1; then
+            echo "Scoped operation refused or interrupted. Stop and inspect before retrying."
+            exit 1
+          fi
+      - name: Verify sealed report without printing its contents
+        id: sealed
         if: always() && steps.execute.outcome != 'skipped'
+        env:
+          EMAIL_REPORT_KEY_SHA256: ${{ vars.EMAIL_REPORT_KEY_SHA256 }}
+          NODE_OPTIONS: ''
+          NODE_V8_COVERAGE: ''
+        run: node scripts/email-report-artifact.mjs
+      - name: Retain only the encrypted report for one day
+        if: always() && steps.sealed.outcome == 'success'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: email-validation-${{ github.run_id }}
-          path: ${{ runner.temp }}/email-validation-report/report.json
+          name: encrypted-validation-report
+          path: ${{ runner.temp }}/email-validation-sealed/report.enc.json
           retention-days: 1
-          if-no-files-found: ignore
+          if-no-files-found: error
       - name: Remove temporary operator files
         if: always()
         run: |
           rm -rf -- .email-validation
-          rm -rf -- "$RUNNER_TEMP/email-validation-report"
+          rm -rf -- "$RUNNER_TEMP/email-validation-private"
+          rm -rf -- "$RUNNER_TEMP/email-validation-sealed"
