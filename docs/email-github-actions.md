@@ -7,6 +7,13 @@ owned disposable fixtures and exact cleanup. Execution is still on hold.
 Preparing/committing this workflow is NOT authorization to trigger it now.
 No GitHub settings, secrets, Production records, sends or cleanup were changed.
 
+Development hardening now encrypts all reports and independently checks the live
+GitHub protection rules and this run's approval history. **Public execution still
+has two code-level holds:** the workflow's private-only job condition and
+`PUBLIC_RUNNER_POLICY.enabled=false`. No variable or input can bypass them.
+See [the hardening and offline decryption guide](email-public-runner-hardening.md)
+before any future activation. Neither key setup nor activation is authorized here.
+
 Use `.github/workflows/production-email-validation.yml` and the GitHub-only adapter
 `scripts/email-github-runner.mjs`. Neither is imported by the application.
 No Replit republish, application change, migration, public endpoint, new hosting
@@ -21,8 +28,11 @@ connection string and TLS. The launcher requires the separately approved host,
 `/neondb`, sslmode=require or verify-full, and a successful actual TLS check.
 There is no Development connection or fallback in the workflow.
 
-This workflow deliberately requires a PRIVATE repository, default branch,
-GitHub-hosted ephemeral Linux runner and protected environment.
+The shipped workflow retains its PRIVATE-only condition as an activation hold.
+The revised adapter has tested public-repository admission controls, but its
+committed public-execution policy is disabled. Both holds require a separately
+reviewed code change before any public run. Default branch, GitHub-hosted
+ephemeral Linux runner and protected environment remain mandatory.
 GitHub currently documents required environment reviewers for private repositories
 as an Enterprise capability: Free/Pro/Team required reviewers are public-only.
 This implementation targets GitHub.com / Enterprise Cloud, not Enterprise Server
@@ -44,13 +54,16 @@ Sources:
 Do not paste credentials into chat or Development. This checklist is configuration
 only: do not click Run workflow during preparation.
 
-1. **Repository/access.** Use the authorized private RateMyOfficial repository.
+1. **Repository/access.** Use only the authorized RateMyOfficial repository.
+   Public activation remains held as described above; do not copy this workflow
+   to another repository or remove its checks to obtain execution.
    Push the prepared commit to its default branch through the normal reviewed
    process; this does not publish Replit. Confirm the default branch contains the
    audited application source tree and all new runner files. The public snapshot
    uses a pinned source-tree digest instead of private Replit commit ancestry.
-   Repository administration and an account entitlement
-   supporting private required reviewers must already be available.
+   Repository administration and actual required-reviewer support must be
+   available for the chosen visibility. A private companion is not a workaround
+   if private required reviewers are unavailable.
 2. **Branch protection.** Require review for changes to the default branch,
    especially `.github/workflows/`, operator scripts, package manifests and the
    validation implementation. Restrict who can write, dispatch and administer
@@ -69,7 +82,7 @@ only: do not click Run workflow during preparation.
    | EMAIL_VALIDATION_ENVIRONMENT_READY | reviewers-required, only AFTER verifying the real rules above |
    | EMAIL_VALIDATION_ALLOWED_REF | refs/heads/ followed by the actual default branch |
    | EMAIL_RUNNER_APPROVED_REVISION | Full reviewed commit SHA that contains this workflow; obtain with git rev-parse HEAD after the final push/merge |
-   | EMAIL_RUNNER_EXPECTED_DB_HOST | Exact hostname in the approved Production TLS connection |
+   | EMAIL_REPORT_KEY_SHA256 | SHA-256 of the approved offline report public key's DER SPKI |
 
    The readiness value is operator attestation, NOT an API verification of
    protection. A new source/merge commit requires fresh source review and updating
@@ -88,6 +101,9 @@ only: do not click Run workflow during preparation.
    | POSTMARK_MESSAGE_STREAM | Existing approved transactional stream |
    | EMAIL_VALIDATION_FIXTURE_JSON | One fixed private fixture scope described below |
    | EMAIL_VALIDATION_INPUT_JSON | Exact current input or reviewed plan; only needed for capture/send planning or apply |
+   | EMAIL_VALIDATION_ACKNOWLEDGEMENT | Exact reviewed operation:sha256, used only for apply; never a workflow input |
+   | EMAIL_REPORT_PUBLIC_KEY | Public SPKI PEM only, from the offline operator; NEVER its private key |
+   | EMAIL_RUNNER_EXPECTED_DB_HOST | Exact approved Production host; stored as a secret to avoid public env logging |
 
    Prefer an existing least-privilege Production service credential. It needs
    the existing CLI's operational DML, including journals/sessions/outbox, and
@@ -109,16 +125,20 @@ only: do not click Run workflow during preparation.
    review, not resetting/deleting business records to force a count.
 7. **Actions policy and report privacy.** Allow only the pinned official
    checkout/setup-node/upload-artifact actions used here. Leave shared caches and
-   debug tracing disabled. Restrict artifact/log readers to trusted people.
-   Reports contain owned addresses, IDs, plans/hashes and statuses, but not raw
-   stdout/stderr, credentials, reset links or bodies. Retention is one day;
-   securely download needed reports before expiry. No email credential is exposed
-   during dependency installation/build; install scripts are disabled.
+   debug tracing disabled. Public-repository artifact/log readers cannot be
+   restricted to trusted people. Only `encrypted-validation-report/report.enc.json`
+   is uploaded, after the envelope gate succeeds; plaintext reports never enter
+   artifacts or stdout. Raw subprocess diagnostics are confined to a separate
+   mode-0700 temporary directory and deleted even on failure. Download and decrypt
+   reports offline before one-day expiry. Do not accept a report from an
+   unverified run. No email credential is passed to dependency installation/build;
+   install scripts and shared caches are disabled.
 8. **Final setup confirmation.** Confirm protection/entitlement, source SHA,
    private secret placement and the fixed fixture scope. STOP without dispatching.
    The current assignment expressly prohibits workflow execution. After the
    operator releases that hold, the existing bounded business approval applies;
-   no new application development or Replit republish should be necessary.
+   no application change or Replit republish is needed. Public activation still
+   requires explicit review of both code holds and approval of the final source SHA.
 
 No GitHub administration or repository connection was configured by these files.
 GitHub-hosted Linux minutes/storage consume the account's existing allowance and
@@ -130,14 +150,16 @@ database and Postmark usage remain subject to their existing plans.
 
 1. Manually dispatch **preflight** on the approved default-branch SHA. The required
    reviewer checks that exact workflow/source and its fixed scope, then approves
-   the job. Download the private report. Preflight is SELECT-only and does not
+   the job. Download and decrypt the sealed report offline. Preflight is SELECT-only and does not
    contact Postmark. It does not prove published web-process settings, sender
    approval or inbox delivery.
-2. Dispatch **plan-fixtures**. Download `email-validation-<GitHub run ID>/report.json`.
+2. Dispatch **plan-fixtures**. Download `encrypted-validation-report/report.enc.json`
+   and decrypt it on the trusted offline operator machine.
    Review `result.plan` and `result.requiredAuthorization`. Only the plan object
    goes into environment secret EMAIL_VALIDATION_INPUT_JSON.
-3. Dispatch **apply**, with acknowledgement exactly equal to the reviewed
-   operation:sha256. The adapter independently recomputes it; the original CLI
+3. Set environment secret EMAIL_VALIDATION_ACKNOWLEDGEMENT to exactly the reviewed
+   operation:sha256, then dispatch **apply** without any public acknowledgement
+   input. The adapter independently recomputes it; the original CLI
    independently checks it again plus freshness, role, collision, baseline and
    ownership constraints. No arbitrary command, file path, SQL or shell is an input.
 4. Use the normal authenticated application/API for the already-approved fixture

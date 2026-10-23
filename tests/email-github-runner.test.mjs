@@ -26,6 +26,10 @@ const fixture = () => ({
   EMAIL_SENSITIVE_PAYLOAD_KEY: "00".repeat(32),
   GITHUB_ACTIONS: "true", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_RUN_ATTEMPT: "1",
   GITHUB_SERVER_URL: "https://github.com", RUNNER_ENVIRONMENT: "github-hosted",
+  GITHUB_REPOSITORY: "Warhead114/RateMyOfficial", GITHUB_REPOSITORY_ID: "947276986",
+  GITHUB_REPOSITORY_OWNER_ID: "133118238", GITHUB_RUN_ID: "123",
+  GITHUB_ACTOR_ID: "1", GITHUB_TRIGGERING_ACTOR: "synthetic-operator",
+  GITHUB_API_URL: "https://api.github.com",
   EMAIL_GITHUB_PRIVATE_REPOSITORY: "true", EMAIL_VALIDATION_ENVIRONMENT_READY: "reviewers-required",
   GITHUB_REF: "refs/heads/main", EMAIL_VALIDATION_ALLOWED_REF: "refs/heads/main",
   GITHUB_SHA: "a".repeat(40), GITHUB_WORKFLOW_SHA: "a".repeat(40),
@@ -128,6 +132,7 @@ test("structured reports exclude preceding and trailing raw process messages", (
     "\nClient removed from pool\n"), expected);
   assert.deepEqual(parseCliResult("connected\n[]\nremoved"), []);
   assert.throws(() => parseCliResult("raw error must not enter artifacts"));
+  assert.throws(() => parseCliResult('{"runnerPreflightPassed":true}\n{"plan":{}}'));
 });
 test("Development invocation refuses without network access or exposing supplied values", () => {
   const marker = "NEVER-LOG-SYNTHETIC-SECRETS";
@@ -139,11 +144,12 @@ test("Development invocation refuses without network access or exposing supplied
   assert.ok(!(child.stdout + child.stderr).includes(marker));
   assert.match(child.stderr, /refused or interrupted/);
 });
-test("workflow has only dispatch, pinned actions, private environment and narrow permissions", () => {
+test("workflow retains activation hold, pinned actions, protected environment and narrow permissions", () => {
   const workflow = readFileSync(".github/workflows/production-email-validation.yml", "utf8");
   assert.match(workflow, /on:\n  workflow_dispatch:/);
   assert.doesNotMatch(workflow, /^\s*(push|pull_request|pull_request_target|schedule|workflow_call):/m);
   assert.match(workflow, /permissions:\n  contents: read/);
+  assert.match(workflow, /  actions: read/);
   assert.doesNotMatch(workflow, /write-all|contents: write|id-token: write|secrets: inherit/);
   assert.match(workflow, /environment: production-email-validation/);
   assert.match(workflow, /cancel-in-progress: false/);
@@ -154,5 +160,14 @@ test("workflow has only dispatch, pinned actions, private environment and narrow
   assert.equal(references.length, 3);
   assert.ok(references.every(r => /@[a-f0-9]{40}$/.test(r)));
   assert.match(workflow, /secrets\.RMO_PRODUCTION_DATABASE_URL/);
+  assert.match(workflow, /github\.event\.repository\.private == true/);
+  assert.match(workflow, /secrets\.EMAIL_VALIDATION_ACKNOWLEDGEMENT/);
+  assert.match(workflow, /secrets\.EMAIL_RUNNER_EXPECTED_DB_HOST/);
+  assert.doesNotMatch(workflow, /inputs\.acknowledgement|vars\.EMAIL_RUNNER_EXPECTED_DB_HOST/);
+  assert.match(workflow, /steps\.sealed\.outcome == 'success'/);
+  assert.match(workflow, /email-validation-sealed\/report\.enc\.json/);
+  assert.match(workflow, /process\.log" 2>&1/);
+  assert.match(workflow, /set -o noclobber/);
+  assert.doesNotMatch(workflow, /GITHUB_OUTPUT|GITHUB_ENV|report\/report\.json|path:.*\*/);
   assert.doesNotMatch(workflow, /email:batch|email:controlled|npm run dev|npm start|db:push/);
 });

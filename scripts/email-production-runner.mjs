@@ -79,8 +79,10 @@ async function main() {
   } finally {
     await client.end();
   }
-  console.log(JSON.stringify({ runnerPreflightPassed: true, productionDatabaseVerified: true,
-    tlsVerified: true, keyFormatValid: true }));
+  if (preflight || process.env.EMAIL_RUNNER_MACHINE_OUTPUT !== "1") {
+    console.log(JSON.stringify({ runnerPreflightPassed: true, productionDatabaseVerified: true,
+      tlsVerified: true, keyFormatValid: true }));
+  }
   if (preflight) return;
 
   // Exactly one invocation. A timeout may leave ambiguous provider acceptance:

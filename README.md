@@ -36,7 +36,8 @@ interface/background assets are included.
 
 Delivery defaults to off. The manual GitHub validation workflow is included as
 source but intentionally rejects public repositories and remains unsuitable for
-execution in this public destination without a separately approved runner design.
+execution in this public destination until the separately approved
+[hardening and activation procedure](docs/email-public-runner-hardening.md) is complete.
 Do not enable secrets, change that guard or trigger jobs as part of synchronization.
 
 See [the protected runner procedure](docs/email-github-actions.md) and
